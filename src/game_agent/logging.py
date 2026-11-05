@@ -33,6 +33,7 @@ class SessionLogger:
                 "event": "observation",
                 "timestamp": self._clock.now(),
                 "observation_id": obs.observation_id,
+                "screenshot_path": obs.screenshot_path,
             }
         )
 

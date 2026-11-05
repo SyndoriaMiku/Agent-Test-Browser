@@ -68,6 +68,29 @@ def test_creates_missing_parent_directory(tmp_path, clock):
     log.close()
     assert (tmp_path / "logs" / "s.jsonl").exists()
 
+def test_log_observation_records_screenshot_path(tmp_path, clock):
+    no_shot = Observation(observation_id="obs-2", screenshot_path=None,
+                          viewport_width=1280, viewport_height=720,
+                          device_scale_factor=1.0, timestamp=1.0)
+    log = SessionLogger(tmp_path / "s.jsonl", clock=clock)
+    log.log_observation(OBS)
+    log.log_observation(no_shot)
+    log.close()
+    rows = _read(tmp_path / "s.jsonl")
+    assert rows[0]["screenshot_path"] == "s1.png"
+    assert rows[1]["screenshot_path"] is None
+
+def test_decision_observation_id_does_not_clobber_record(tmp_path, clock):
+    log = SessionLogger(tmp_path / "s.jsonl", clock=clock)
+    d = Decision.model_validate({"state":"s","reason":"r","confidence":0.9,
+                                 "observation_id":"decision-own",
+                                 "action":{"type":"click","x":1,"y":1}})
+    log.log_decision(OBS, d)
+    log.close()
+    row = _read(tmp_path / "s.jsonl")[0]
+    assert row["observation_id"] == "obs-1"
+    assert row["decision"]["observation_id"] == "decision-own"
+
 def test_default_clock_is_monotonic(tmp_path):
     log = SessionLogger(tmp_path / "s.jsonl")
     log.log_observation(OBS)
