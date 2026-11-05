@@ -44,9 +44,7 @@ _TRANSITIONS: dict[State, frozenset[State]] = {
     State.VERIFYING: frozenset(
         {State.OBSERVING, State.DONE, State.RECOVERING, State.NEEDS_USER, State.STOPPED}
     ),
-    State.RECOVERING: frozenset(
-        {State.OBSERVING, State.VERIFYING, State.NEEDS_USER, State.STOPPED}
-    ),
+    State.RECOVERING: frozenset({State.OBSERVING, State.NEEDS_USER, State.STOPPED}),
     State.DONE: frozenset({State.STOPPED}),
     State.NEEDS_USER: frozenset({State.OBSERVING, State.STOPPED}),
     State.STOPPED: frozenset(),

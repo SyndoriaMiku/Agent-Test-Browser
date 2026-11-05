@@ -25,9 +25,11 @@ def test_failures_cap_forces_needs_user():
     m.transition(State.OBSERVING); m.transition(State.DECIDING)
     m.transition(State.VALIDATING); m.transition(State.ACTING); m.transition(State.VERIFYING)
     m.note_failure()  # 1
-    m.transition(State.RECOVERING); m.transition(State.VERIFYING)
+    m.transition(State.RECOVERING)
+    m.transition(State.OBSERVING)  # recovery succeeded, back to observing (spec §11)
+    for s in [State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
+        m.transition(s)
     m.note_failure()  # 2 -> cap
-    assert m.state == State.VERIFYING
     m.transition(State.NEEDS_USER)
     assert m.state == State.NEEDS_USER
     m.transition(State.OBSERVING)  # human resumed
@@ -40,6 +42,14 @@ def test_recovering_and_needs_user_have_exits():
     assert m.can(State.OBSERVING)
     assert m.can(State.NEEDS_USER)
     assert m.can(State.STOPPED)
+
+def test_recovering_cannot_go_to_verifying():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.RECOVERING]:
+        m.transition(s)
+    assert not m.can(State.VERIFYING)
+    with pytest.raises(InvalidTransition):
+        m.transition(State.VERIFYING)
 
 def test_idle_can_reach_observing_and_stopped():
     m = StateMachine()
