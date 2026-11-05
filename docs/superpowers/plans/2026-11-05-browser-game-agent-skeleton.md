@@ -28,7 +28,7 @@ Input classes and failure modes the spec implies but no task's happy path covers
 2. **Coordinate boundaries**: `x`/`y` exactly `0`, exactly `viewport_width`/`height`, negative, and non-integer — must be accepted at the closed edge and rejected outside. Pinned in Task 6.
 3. **`hold` interrupted mid-flight**: an exception during the wait must still trigger a safe `release`, and held-state must not dangle. Guaranteed by the release invariant documented in Task 2 and exercised by the controller stub contract in Task 9.
 4. **Action/rate/budget exhaustion exactly at the threshold** (off-by-one): the boundary action must be the first rejected. Pinned in Task 6.
-5. **Repeated failing verification**: consecutive failures must reach the cap and force `NEEDS_USER`, never loop forever. Pinned in Task 7.
+5. **Repeated failing verification**: consecutive failures must reach the cap and force `NEEDS_USER`, never loop forever. The retry/failure counter lives on `SessionState` (Task 5); the cap is enforced by the M3 driver. Task 7 pins only that `NEEDS_USER` is reachable from `VERIFYING` and resumable.
 
 ---
 
@@ -531,7 +531,7 @@ git commit -m "feat: add pure ActionValidator"
 
 **Interfaces:**
 - Consumes: nothing (uses a plain monotonic default clock internally if needed).
-- Produces: `State` enum (`IDLE`,`OBSERVING`,`DECIDING`,`VALIDATING`,`ACTING`,`VERIFYING`,`RECOVERING`,`DONE`,`NEEDS_USER`,`STOPPED`); `InvalidTransition(Exception)`; `StateMachine` with `__init__(self, max_consecutive_failures: int = 3)`, `state -> State`, `can(self, target: State) -> bool`, `transition(self, target: State) -> None`, `note_failure(self) -> None`, `note_success(self) -> None`, `stop(self) -> None`.
+- Produces: `State` enum (`IDLE`,`OBSERVING`,`DECIDING`,`VALIDATING`,`ACTING`,`VERIFYING`,`RECOVERING`,`DONE`,`NEEDS_USER`,`STOPPED`); `InvalidTransition(Exception)`; `StateMachine` with `__init__(self)`, `state -> State`, `can(self, target: State) -> bool`, `transition(self, target: State) -> None`, `stop(self) -> None`. The state machine is a **pure transition guard** — it does NOT own failure/retry counting. Retry/failure counters live on `SessionState` (spec §17 "số retry"); the M3 driver reads `SessionState.snapshot().consecutive_failures` and requests `NEEDS_USER` when the cap is reached.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -559,20 +559,22 @@ def test_done_is_reachable_from_validating():
     m.transition(State.DONE)
     assert m.state == State.DONE
 
-def test_failures_cap_forces_needs_user():
-    m = StateMachine(max_consecutive_failures=2)
-    m.transition(State.OBSERVING); m.transition(State.DECIDING)
-    m.transition(State.VALIDATING); m.transition(State.ACTING); m.transition(State.VERIFYING)
-    m.note_failure()  # 1
-    m.transition(State.RECOVERING)
-    m.transition(State.OBSERVING)  # recovery succeeded, back to observing (spec §11)
-    for s in [State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
+def test_needs_user_reachable_from_verifying_and_resumable():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
         m.transition(s)
-    m.note_failure()  # 2 -> cap
     m.transition(State.NEEDS_USER)
     assert m.state == State.NEEDS_USER
     m.transition(State.OBSERVING)  # human resumed
     assert m.state == State.OBSERVING
+
+def test_recovering_cannot_go_to_verifying():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.RECOVERING]:
+        m.transition(s)
+    assert not m.can(State.VERIFYING)
+    with pytest.raises(InvalidTransition):
+        m.transition(State.VERIFYING)
 
 def test_recovering_and_needs_user_have_exits():
     m = StateMachine()
@@ -607,12 +609,12 @@ Encode the transition table from the spec exactly:
 `DECIDING→{VALIDATING,NEEDS_USER,STOPPED}`, `VALIDATING→{ACTING,OBSERVING,DONE,NEEDS_USER,STOPPED}`,
 `ACTING→{VERIFYING,RECOVERING,STOPPED}`, `VERIFYING→{OBSERVING,DONE,RECOVERING,NEEDS_USER,STOPPED}`,
 `RECOVERING→{OBSERVING,NEEDS_USER,STOPPED}`, `DONE→{STOPPED}`, `NEEDS_USER→{OBSERVING,STOPPED}`, `STOPPED→{}`.
-`note_failure()` increments the counter; `note_success()` resets it. `transition` raises `InvalidTransition(target)` when the pair is absent. `stop()` sets `STOPPED` directly.
+`transition` validates before mutating and raises `InvalidTransition(target)` when the pair is absent. `stop()` sets `STOPPED` directly. There is NO failure/retry counter here (it belongs to `SessionState`).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\python -m pytest tests/test_state.py -v`
-Expected: PASS (7 tests).
+Expected: PASS (8 tests).
 
 - [ ] **Step 5: Commit**
 
