@@ -28,7 +28,7 @@ Input classes and failure modes the spec implies but no task's happy path covers
 2. **Coordinate boundaries**: `x`/`y` exactly `0`, exactly `viewport_width`/`height`, negative, and non-integer — must be accepted at the closed edge and rejected outside. Pinned in Task 6.
 3. **`hold` interrupted mid-flight**: an exception during the wait must still trigger a safe `release`, and held-state must not dangle. Guaranteed by the release invariant documented in Task 2 and exercised by the controller stub contract in Task 9.
 4. **Action/rate/budget exhaustion exactly at the threshold** (off-by-one): the boundary action must be the first rejected. Pinned in Task 6.
-5. **Repeated failing verification**: consecutive failures must reach the cap and force `NEEDS_USER`, never loop forever. Pinned in Task 7.
+5. **Repeated failing verification**: consecutive failures must reach the cap and force `NEEDS_USER`, never loop forever. The retry/failure counter lives on `SessionState` (Task 5); the cap is enforced by the M3 driver. Task 7 pins only that `NEEDS_USER` is reachable from `VERIFYING` and resumable.
 
 ---
 
@@ -88,6 +88,7 @@ logs/
 screenshots/
 output/
 .pytest_cache/
+.superpowers/
 ```
 `.env.example`:
 ```
@@ -436,7 +437,7 @@ git commit -m "feat: add SessionState with injected clock"
 
 **Interfaces:**
 - Consumes: `Settings` (Task 2), `Decision`/`Action`/`HoldAction`/`UncertainAction` (Task 3), `StateSnapshot` (Task 5).
-- Produces: `RejectedReason` enum (`OUT_OF_BOUNDS`,`NOT_ALLOWED`,`RATE_LIMITED`,`BUDGET_EXCEEDED`,`LOW_CONFIDENCE`); `ValidationResult` frozen dataclass with `accepted:bool` and `reason:RejectedReason|None`; `validate(decision: Decision, snapshot: StateSnapshot, now: float, settings: Settings) -> ValidationResult` (pure, no side effects).
+- Produces: `RejectedReason` enum (`OUT_OF_BOUNDS`,`NOT_ALLOWED`,`LIMIT_EXCEEDED`,`RATE_LIMITED`,`BUDGET_EXCEEDED`,`LOW_CONFIDENCE`); `ValidationResult` frozen dataclass with `accepted:bool` and `reason:RejectedReason|None`; `validate(decision: Decision, snapshot: StateSnapshot, now: float, settings: Settings) -> ValidationResult` (pure, no side effects).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -474,9 +475,10 @@ def test_rejects_key_not_in_allowlist():
     assert validate(_dec({"type":"press","key":"f13"}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
 
 def test_rate_limit_boundary():
-    # last action at t=10.0, min interval 0.2s -> 10.199 too soon, 10.2 ok
-    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.199, settings=SETTINGS).reason == RejectedReason.RATE_LIMITED
-    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.2, settings=SETTINGS).accepted
+    # last action at t=10.0, min interval 200ms. Use binary-exact deltas (0.125s, 0.25s)
+    # so the boundary assertion is not corrupted by float rounding.
+    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.125, settings=SETTINGS).reason == RejectedReason.RATE_LIMITED
+    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.25, settings=SETTINGS).accepted
 
 def test_budget_boundary_off_by_one():
     assert validate(_dec({"type":"move","x":1,"y":1}), _snap(count=1), now=10.0, settings=SETTINGS).accepted
@@ -484,11 +486,11 @@ def test_budget_boundary_off_by_one():
 
 def test_hold_accumulation_guard():
     assert validate(_dec({"type":"hold","key":"w","duration_ms":500}), _snap(hold=500), now=10.0, settings=SETTINGS).accepted
-    assert validate(_dec({"type":"hold","key":"w","duration_ms":600}), _snap(hold=500), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
+    assert validate(_dec({"type":"hold","key":"w","duration_ms":600}), _snap(hold=500), now=10.0, settings=SETTINGS).reason == RejectedReason.LIMIT_EXCEEDED
 
 def test_wheel_delta_guard():
     assert validate(_dec({"type":"wheel","delta_y":100}), _snap(), now=10.0, settings=SETTINGS).accepted
-    assert validate(_dec({"type":"wheel","delta_y":101}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
+    assert validate(_dec({"type":"wheel","delta_y":101}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.LIMIT_EXCEEDED
 
 def test_low_confidence_rejected():
     assert validate(_dec({"type":"click","x":1,"y":1}, conf=0.4), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.LOW_CONFIDENCE
@@ -505,7 +507,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'game_agent.validation'
 
 - [ ] **Step 3: Implement `validation.py`**
 
-Order of checks (first rejection wins): (1) `confidence < settings.confidence_threshold` → `LOW_CONFIDENCE`; (2) `done`/`uncertain` bypass all remaining checks and are accepted; (3) coordinate bounds for `click/move/drag/wheel` (wheel checks only `abs(delta)` ≤ `max_wheel_delta`, no position); (4) allowlist for `press/hold/release` keys and buttons; (5) duration guards (`wait` ≤ `max_wait_ms`, `hold` accumulated ≤ `max_hold_ms`); (6) rate limit (`last_action_at is None` passes, else `now - last_action_at >= min_action_interval_ms/1000`); (7) budget (`action_count >= max_actions_per_session` → `BUDGET_EXCEEDED`). Return `ValidationResult`. No mutation of `snapshot` or any global.
+Order of checks (first rejection wins): (1) `confidence < settings.confidence_threshold` → `LOW_CONFIDENCE`; (2) `done`/`uncertain` bypass all remaining checks and are accepted; (3) coordinate bounds for `click/move/drag` → `OUT_OF_BOUNDS` when any coordinate is `< 0` or `> viewport_*`; `wheel` instead checks `abs(delta) <= max_wheel_delta` and rejects with `LIMIT_EXCEEDED`; (4) allowlist for keys (`press`/`hold`/`release`) and buttons (`click`/`drag`/`hold`/`release`) → `NOT_ALLOWED`; (5) duration guards (`wait` ≤ `max_wait_ms`, `hold` accumulated + this hold ≤ `max_hold_ms`) → `LIMIT_EXCEEDED`; (6) rate limit (`last_action_at is None` passes, else reject when `now - last_action_at < min_action_interval_ms / 1000`) → `RATE_LIMITED`; (7) budget (`action_count >= max_actions_per_session` → `BUDGET_EXCEEDED`). Return `ValidationResult`. No mutation of `snapshot` or any global.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -529,7 +531,7 @@ git commit -m "feat: add pure ActionValidator"
 
 **Interfaces:**
 - Consumes: nothing (uses a plain monotonic default clock internally if needed).
-- Produces: `State` enum (`IDLE`,`OBSERVING`,`DECIDING`,`VALIDATING`,`ACTING`,`VERIFYING`,`RECOVERING`,`DONE`,`NEEDS_USER`,`STOPPED`); `InvalidTransition(Exception)`; `StateMachine` with `__init__(self, max_consecutive_failures: int = 3)`, `state -> State`, `can(self, target: State) -> bool`, `transition(self, target: State) -> None`, `note_failure(self) -> None`, `note_success(self) -> None`, `stop(self) -> None`.
+- Produces: `State` enum (`IDLE`,`OBSERVING`,`DECIDING`,`VALIDATING`,`ACTING`,`VERIFYING`,`RECOVERING`,`DONE`,`NEEDS_USER`,`STOPPED`); `InvalidTransition(Exception)`; `StateMachine` with `__init__(self)`, `state -> State`, `can(self, target: State) -> bool`, `transition(self, target: State) -> None`, `stop(self) -> None`. The state machine is a **pure transition guard** — it does NOT own failure/retry counting. Retry/failure counters live on `SessionState` (spec §17 "số retry"); the M3 driver reads `SessionState.snapshot().consecutive_failures` and requests `NEEDS_USER` when the cap is reached.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -557,25 +559,35 @@ def test_done_is_reachable_from_validating():
     m.transition(State.DONE)
     assert m.state == State.DONE
 
-def test_failures_cap_forces_needs_user():
-    m = StateMachine(max_consecutive_failures=2)
-    m.transition(State.OBSERVING); m.transition(State.DECIDING)
-    m.transition(State.VALIDATING); m.transition(State.ACTING); m.transition(State.VERIFYING)
-    m.note_failure()  # 1
-    m.transition(State.RECOVERING); m.transition(State.VERIFYING)
-    m.note_failure()  # 2 -> cap
-    assert m.state == State.VERIFYING
+def test_needs_user_reachable_from_verifying_and_resumable():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
+        m.transition(s)
     m.transition(State.NEEDS_USER)
     assert m.state == State.NEEDS_USER
     m.transition(State.OBSERVING)  # human resumed
     assert m.state == State.OBSERVING
 
-def test_every_state_can_reach_a_terminal():
-    for s in State:
-        m = StateMachine()
-        assert m.can(State.OBSERVING) or s in (State.OBSERVING, State.STOPPED, State.DONE) or True
+def test_recovering_cannot_go_to_verifying():
     m = StateMachine()
-    assert m.can(State.STOPPED)  # from IDLE
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.RECOVERING]:
+        m.transition(s)
+    assert not m.can(State.VERIFYING)
+    with pytest.raises(InvalidTransition):
+        m.transition(State.VERIFYING)
+
+def test_recovering_and_needs_user_have_exits():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.RECOVERING]:
+        m.transition(s)
+    assert m.can(State.OBSERVING)
+    assert m.can(State.NEEDS_USER)
+    assert m.can(State.STOPPED)
+
+def test_idle_can_reach_observing_and_stopped():
+    m = StateMachine()
+    assert m.can(State.OBSERVING)
+    assert m.can(State.STOPPED)
 
 def test_stop_is_terminal():
     m = StateMachine()
@@ -597,12 +609,12 @@ Encode the transition table from the spec exactly:
 `DECIDING→{VALIDATING,NEEDS_USER,STOPPED}`, `VALIDATING→{ACTING,OBSERVING,DONE,NEEDS_USER,STOPPED}`,
 `ACTING→{VERIFYING,RECOVERING,STOPPED}`, `VERIFYING→{OBSERVING,DONE,RECOVERING,NEEDS_USER,STOPPED}`,
 `RECOVERING→{OBSERVING,NEEDS_USER,STOPPED}`, `DONE→{STOPPED}`, `NEEDS_USER→{OBSERVING,STOPPED}`, `STOPPED→{}`.
-`note_failure()` increments the counter; `note_success()` resets it. `transition` raises `InvalidTransition(target)` when the pair is absent. `stop()` sets `STOPPED` directly.
+`transition` validates before mutating and raises `InvalidTransition(target)` when the pair is absent. `stop()` sets `STOPPED` directly. There is NO failure/retry counter here (it belongs to `SessionState`).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\python -m pytest tests/test_state.py -v`
-Expected: PASS (6 tests).
+Expected: PASS (8 tests).
 
 - [ ] **Step 5: Commit**
 
