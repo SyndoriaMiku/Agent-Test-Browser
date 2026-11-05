@@ -2,9 +2,8 @@
 
 States form a table-driven lifecycle starting at ``IDLE``; every move is
 validated against the transition table and illegal moves raise
-``InvalidTransition``. ``STOPPED`` is terminal. ``note_failure()`` /
-``note_success()`` track a consecutive-failure streak so the caller can route
-to ``NEEDS_USER`` once ``max_consecutive_failures`` is reached.
+``InvalidTransition``. ``STOPPED`` is terminal. The machine is a pure
+transition guard — retry/failure counting is owned by ``SessionState``.
 """
 
 from enum import Enum, auto
@@ -54,10 +53,8 @@ _TRANSITIONS: dict[State, frozenset[State]] = {
 class StateMachine:
     """Lifecycle state machine guarded by the transition table."""
 
-    def __init__(self, max_consecutive_failures: int = 3) -> None:
-        self._max_consecutive_failures = max_consecutive_failures
+    def __init__(self) -> None:
         self._state = State.IDLE
-        self._consecutive_failures = 0
 
     @property
     def state(self) -> State:
@@ -72,14 +69,6 @@ class StateMachine:
         if not self.can(target):
             raise InvalidTransition(target)
         self._state = target
-
-    def note_failure(self) -> None:
-        """Extend the consecutive-failure streak by one."""
-        self._consecutive_failures += 1
-
-    def note_success(self) -> None:
-        """Reset the consecutive-failure streak."""
-        self._consecutive_failures = 0
 
     def stop(self) -> None:
         """Force the machine into the terminal ``STOPPED`` state."""

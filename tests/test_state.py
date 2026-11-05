@@ -20,16 +20,10 @@ def test_done_is_reachable_from_validating():
     m.transition(State.DONE)
     assert m.state == State.DONE
 
-def test_failures_cap_forces_needs_user():
-    m = StateMachine(max_consecutive_failures=2)
-    m.transition(State.OBSERVING); m.transition(State.DECIDING)
-    m.transition(State.VALIDATING); m.transition(State.ACTING); m.transition(State.VERIFYING)
-    m.note_failure()  # 1
-    m.transition(State.RECOVERING)
-    m.transition(State.OBSERVING)  # recovery succeeded, back to observing (spec §11)
-    for s in [State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
+def test_needs_user_reachable_from_verifying_and_resumable():
+    m = StateMachine()
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
         m.transition(s)
-    m.note_failure()  # 2 -> cap
     m.transition(State.NEEDS_USER)
     assert m.state == State.NEEDS_USER
     m.transition(State.OBSERVING)  # human resumed
