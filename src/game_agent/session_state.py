@@ -19,7 +19,7 @@ class Clock(Protocol):
     def now(self) -> float: ...
 
 
-class _MonotonicClock:
+class MonotonicClock:
     """Default ``Clock`` backed by ``time.monotonic``."""
 
     def now(self) -> float:
@@ -41,7 +41,7 @@ class SessionState:
 
     def __init__(self, settings: Settings, clock: Clock | None = None) -> None:
         self._settings = settings
-        self._clock: Clock = _MonotonicClock() if clock is None else clock
+        self._clock: Clock = MonotonicClock() if clock is None else clock
         self._action_count = 0
         self._accumulated_hold_ms = 0
         self._consecutive_failures = 0
