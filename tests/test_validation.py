@@ -8,6 +8,15 @@ SETTINGS = Settings(viewport_width=1280, viewport_height=720,
                     min_action_interval_ms=200, max_actions_per_session=2,
                     max_hold_ms=1000, max_wheel_delta=100, confidence_threshold=0.5)
 
+LEFT_ONLY_SETTINGS = Settings(viewport_width=1280, viewport_height=720,
+                               min_action_interval_ms=200, max_actions_per_session=2,
+                               max_hold_ms=1000, max_wheel_delta=100, confidence_threshold=0.5,
+                               allowed_buttons=frozenset({"left"}))
+RIGHT_ONLY_SETTINGS = Settings(viewport_width=1280, viewport_height=720,
+                                min_action_interval_ms=200, max_actions_per_session=2,
+                                max_hold_ms=1000, max_wheel_delta=100, confidence_threshold=0.5,
+                                allowed_buttons=frozenset({"right"}))
+
 def _snap(count=0, hold=0, fails=0, last=None):
     return StateSnapshot(action_count=count, accumulated_hold_ms=hold,
                          consecutive_failures=fails, last_action_at=last)
@@ -53,3 +62,17 @@ def test_low_confidence_rejected():
 def test_done_and_uncertain_bypass_rate_and_budget():
     assert validate(_dec({"type":"done","summary":"won"}), _snap(count=99, last=10.0), now=10.0, settings=SETTINGS).accepted
     assert validate(_dec({"type":"uncertain","reason":"unknown"}), _snap(count=99, last=10.0), now=10.0, settings=SETTINGS).accepted
+
+def test_rejects_click_button_not_in_allowlist():
+    assert validate(_dec({"type":"click","x":10,"y":10,"button":"right"}), _snap(), now=10.0, settings=LEFT_ONLY_SETTINGS).reason == RejectedReason.NOT_ALLOWED
+
+def test_accepts_click_button_in_allowlist():
+    assert validate(_dec({"type":"click","x":10,"y":10,"button":"right"}), _snap(), now=10.0, settings=RIGHT_ONLY_SETTINGS).accepted
+
+def test_rejects_drag_button_not_in_allowlist():
+    action = {"type":"drag","start_x":10,"start_y":10,"end_x":20,"end_y":20,"duration_ms":100,"button":"right"}
+    assert validate(_dec(action), _snap(), now=10.0, settings=LEFT_ONLY_SETTINGS).reason == RejectedReason.NOT_ALLOWED
+
+def test_accepts_drag_button_in_allowlist():
+    action = {"type":"drag","start_x":10,"start_y":10,"end_x":20,"end_y":20,"duration_ms":100,"button":"right"}
+    assert validate(_dec(action), _snap(), now=10.0, settings=RIGHT_ONLY_SETTINGS).accepted

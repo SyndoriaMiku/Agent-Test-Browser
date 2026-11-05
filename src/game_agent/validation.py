@@ -133,7 +133,15 @@ def _coordinate_pairs(action: Action) -> tuple[tuple[int, int], ...]:
 
 
 def _check_allowlist(action: Action, settings: Settings) -> RejectedReason | None:
-    """Check key/button targets against the configured allowlists."""
+    """Check key/button targets against the configured allowlists.
+
+    Every mouse button an action can target -- the button of a ``click`` or
+    ``drag``, and the button of a ``hold``/``release`` -- must be listed in
+    ``settings.allowed_buttons``. Buttons are compared by their string value
+    (``schema.Button`` is a ``(str, Enum)`` mixin whose hash follows the enum
+    member name, so the enum member itself would never match a set of
+    strings).
+    """
     if isinstance(action, PressAction):
         return None if action.key in settings.allowed_keys else RejectedReason.NOT_ALLOWED
 
@@ -145,6 +153,10 @@ def _check_allowlist(action: Action, settings: Settings) -> RejectedReason | Non
         else:
             # Unreachable: the schema requires exactly one of key/button.
             allowed = False
+        return None if allowed else RejectedReason.NOT_ALLOWED
+
+    if isinstance(action, (ClickAction, DragAction)):
+        allowed = action.button.value in settings.allowed_buttons
         return None if allowed else RejectedReason.NOT_ALLOWED
 
     return None
