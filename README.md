@@ -31,16 +31,35 @@ cross-action timing is driven by an injected fake clock.
 .venv\Scripts\python -m pytest
 ```
 
+## Configuration
+
+Defaults live in `Settings` (`src/game_agent/config.py`). Each numeric field can be overridden by
+setting a `GAME_AGENT_<FIELD_UPPER>` variable in the **process environment** before launching the
+agent — for example, in PowerShell:
+
+```powershell
+$env:GAME_AGENT_VIEWPORT_WIDTH = "1920"
+```
+
+- **Numeric fields only.** Overrides apply to the int/float settings (viewport, scale factor,
+  action budget, rate/hold/wait/wheel limits, confidence threshold — which must stay within
+  `[0.0, 1.0]`). The key/button allowlists are code-defined for now and ignore environment
+  variables; per-game allowlist configuration is planned for M1.
+- **`.env` is not auto-loaded yet.** `load_settings` reads `os.environ` only — there is no dotenv
+  loading. [`.env.example`](.env.example) documents the variable names for that planned
+  auto-load (`python-dotenv` is already a declared dependency for it), but copying it to `.env`
+  today has no effect; set the variables in your shell instead.
+
 ## Module map (`src/game_agent`)
 
 | Module | Role |
 |---|---|
-| `config.py` | Frozen `Settings` + `load_settings`: viewport, action budget, rate limit, hold/wait/wheel limits, confidence threshold, key/button allowlists; `GAME_AGENT_*` env overrides (see `.env.example`) |
+| `config.py` | Frozen `Settings` + `load_settings`: viewport, action budget, rate limit, hold/wait/wheel limits, confidence threshold, key/button allowlists; `GAME_AGENT_*` env overrides for the numeric fields only (see [Configuration](#configuration)) |
 | `schema.py` | `Decision` + `Action` — Pydantic v2 discriminated union over ten action types (`click`, `move`, `press`, `hold`, `release`, `drag`, `wheel`, `wait`, `done`, `uncertain`); extra fields and out-of-range values fail at parse |
 | `observation.py` | `Observation` value type: `observation_id`, `screenshot_path`, viewport, `device_scale_factor`, `timestamp` |
 | `session_state.py` | `SessionState` — the single mutable owner of cross-action counters (action budget, accumulated hold time, consecutive failures, last action time) behind an injected `Clock`; exposes an immutable `StateSnapshot` |
 | `validation.py` | `validate(decision, snapshot, now, settings)` — **pure** gate: coordinate bounds, key/button allowlists, rate, budget, hold/wheel limits, confidence → `accepted | rejected(reason)` |
-| `state.py` | `StateMachine` — pure transition guard over `idle → observing → deciding → validating → acting → verifying`, plus `recovering`, `done`, `needs_user`, `stopped`; every state has an exit |
+| `state.py` | `StateMachine` — pure transition guard over `IDLE → OBSERVING → DECIDING → VALIDATING → ACTING → VERIFYING`, plus `RECOVERING`, `DONE`, `NEEDS_USER`, `STOPPED`; every state has an exit |
 | `logging.py` | `SessionLogger` — one JSON object per line, records linked by `observation_id`; never writes secrets |
 | `controller.py` | `BrowserController` — async stub for the Playwright executor (M1); will own held key/button tracking and the safe `release_all` recovery primitive |
 | `vlm.py` | `VLMClient` — async stub for the vision model client (M2); must return a schema-valid `Decision`, never arbitrary code |
