@@ -8,7 +8,14 @@ validator, not the schema.
 from enum import Enum
 from typing import Annotated, Literal, Self, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    model_validator,
+)
 
 
 class Button(str, Enum):
@@ -42,18 +49,18 @@ class ClickAction(_Base):
     """Click a mouse button at coordinates."""
 
     type: Literal["click"] = "click"
-    x: int
-    y: int
+    x: StrictInt
+    y: StrictInt
     button: Button = Button.LEFT
-    click_count: int = Field(default=1, ge=1, le=3)
+    click_count: StrictInt = Field(default=1, ge=1, le=3)
 
 
 class MoveAction(_Base):
     """Move the pointer to coordinates."""
 
     type: Literal["move"] = "move"
-    x: int
-    y: int
+    x: StrictInt
+    y: StrictInt
 
 
 class PressAction(_Base):
@@ -67,7 +74,7 @@ class HoldAction(_KeyOrButton):
     """Hold a key or button down for a duration."""
 
     type: Literal["hold"] = "hold"
-    duration_ms: int = Field(gt=0)
+    duration_ms: StrictInt = Field(gt=0)
 
 
 class ReleaseAction(_KeyOrButton):
@@ -80,10 +87,11 @@ class DragAction(_Base):
     """Drag from one point to another with a mouse button held."""
 
     type: Literal["drag"] = "drag"
-    from_x: int
-    from_y: int
-    to_x: int
-    to_y: int
+    start_x: StrictInt
+    start_y: StrictInt
+    end_x: StrictInt
+    end_y: StrictInt
+    duration_ms: StrictInt = Field(gt=0)
     button: Button = Button.LEFT
 
 
@@ -91,15 +99,15 @@ class WheelAction(_Base):
     """Scroll the mouse wheel by pixel deltas."""
 
     type: Literal["wheel"] = "wheel"
-    dx: int = 0
-    dy: int = 0
+    delta_x: StrictInt = 0
+    delta_y: StrictInt = 0
 
 
 class WaitAction(_Base):
     """Wait for a duration."""
 
     type: Literal["wait"] = "wait"
-    duration_ms: int = Field(gt=0)
+    duration_ms: StrictInt = Field(gt=0)
 
 
 class DoneAction(_Base):
@@ -113,7 +121,7 @@ class UncertainAction(_Base):
     """Report that the screen cannot be interpreted confidently."""
 
     type: Literal["uncertain"] = "uncertain"
-    summary: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 Action = Annotated[
@@ -140,5 +148,5 @@ class Decision(_Base):
     reason: str = Field(min_length=1)
     action: Action
     expected_result: str | None = None
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: StrictFloat = Field(ge=0.0, le=1.0)
     observation_id: str | None = None
