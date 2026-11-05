@@ -33,3 +33,7 @@ def test_last_action_at_tracks_clock(clock):
     clock.advance(5.0)
     s.record(ClickAction(type="click", x=1, y=1), clock.now())
     assert s.last_action_at == 5.0
+
+def test_default_clock_satisfies_clock_protocol():
+    s = SessionState(Settings())
+    assert isinstance(s._clock.now(), float)

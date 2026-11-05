@@ -1,7 +1,7 @@
 """Session state: action budget, hold accumulation, and failure streaks.
 
 Time comes from an injected ``Clock`` so tests can advance it; production
-uses ``time.monotonic``. Counters are read-only from outside; ``snapshot()``
+uses a ``time.monotonic``-backed clock. Counters are read-only from outside; ``snapshot()``
 returns an immutable copy for safe sharing.
 """
 
@@ -19,6 +19,13 @@ class Clock(Protocol):
     def now(self) -> float: ...
 
 
+class _MonotonicClock:
+    """Default ``Clock`` backed by ``time.monotonic``."""
+
+    def now(self) -> float:
+        return time.monotonic()
+
+
 @dataclass(frozen=True)
 class StateSnapshot:
     """Immutable copy of the session counters at a point in time."""
@@ -34,7 +41,7 @@ class SessionState:
 
     def __init__(self, settings: Settings, clock: Clock | None = None) -> None:
         self._settings = settings
-        self._clock: Clock = time.monotonic if clock is None else clock
+        self._clock: Clock = _MonotonicClock() if clock is None else clock
         self._action_count = 0
         self._accumulated_hold_ms = 0
         self._consecutive_failures = 0
