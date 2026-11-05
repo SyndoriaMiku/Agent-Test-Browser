@@ -1,3 +1,5 @@
+import pytest
+
 from game_agent.config import Settings, load_settings
 
 def test_defaults():
@@ -20,3 +22,12 @@ def test_settings_is_frozen():
     except Exception:
         return
     raise AssertionError("Settings must be immutable")
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_non_finite_float_override_rejected(raw):
+    with pytest.raises(ValueError, match="confidence_threshold"):
+        load_settings(env={"GAME_AGENT_CONFIDENCE_THRESHOLD": raw})
+
+def test_out_of_range_confidence_threshold_rejected():
+    with pytest.raises(ValueError, match="confidence_threshold"):
+        load_settings(env={"GAME_AGENT_CONFIDENCE_THRESHOLD": "1.5"})

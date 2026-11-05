@@ -1,5 +1,6 @@
 """Configuration: frozen Settings defaults plus GAME_AGENT_* environment overrides."""
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -36,6 +37,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     the process environment), otherwise reads ``os.environ``. Only int/float
     fields are overridable via environment; the frozenset allowlists use their
     dataclass defaults (per-item allowlist configuration is deferred to M1).
+    Float overrides must be finite, and ``confidence_threshold`` must lie in
+    [0.0, 1.0] so it can never silently disable the low-confidence guard.
     """
     source: Mapping[str, str] = os.environ if env is None else env
     overrides: dict[str, int | float] = {}
@@ -48,5 +51,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         if isinstance(f.default, int):
             overrides[f.name] = int(raw)
         elif isinstance(f.default, float):
-            overrides[f.name] = float(raw)
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError(f"{f.name} must be a finite float, got {raw!r}")
+            if f.name == "confidence_threshold" and not 0.0 <= value <= 1.0:
+                raise ValueError(f"{f.name} must be within [0.0, 1.0], got {raw!r}")
+            overrides[f.name] = value
     return Settings(**overrides)
