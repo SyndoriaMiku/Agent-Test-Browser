@@ -564,9 +564,11 @@ def test_failures_cap_forces_needs_user():
     m.transition(State.OBSERVING); m.transition(State.DECIDING)
     m.transition(State.VALIDATING); m.transition(State.ACTING); m.transition(State.VERIFYING)
     m.note_failure()  # 1
-    m.transition(State.RECOVERING); m.transition(State.VERIFYING)
+    m.transition(State.RECOVERING)
+    m.transition(State.OBSERVING)  # recovery succeeded, back to observing (spec §11)
+    for s in [State.DECIDING, State.VALIDATING, State.ACTING, State.VERIFYING]:
+        m.transition(s)
     m.note_failure()  # 2 -> cap
-    assert m.state == State.VERIFYING
     m.transition(State.NEEDS_USER)
     assert m.state == State.NEEDS_USER
     m.transition(State.OBSERVING)  # human resumed
