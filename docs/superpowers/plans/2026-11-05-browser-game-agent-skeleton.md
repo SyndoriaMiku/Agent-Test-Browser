@@ -88,6 +88,7 @@ logs/
 screenshots/
 output/
 .pytest_cache/
+.superpowers/
 ```
 `.env.example`:
 ```
@@ -436,7 +437,7 @@ git commit -m "feat: add SessionState with injected clock"
 
 **Interfaces:**
 - Consumes: `Settings` (Task 2), `Decision`/`Action`/`HoldAction`/`UncertainAction` (Task 3), `StateSnapshot` (Task 5).
-- Produces: `RejectedReason` enum (`OUT_OF_BOUNDS`,`NOT_ALLOWED`,`RATE_LIMITED`,`BUDGET_EXCEEDED`,`LOW_CONFIDENCE`); `ValidationResult` frozen dataclass with `accepted:bool` and `reason:RejectedReason|None`; `validate(decision: Decision, snapshot: StateSnapshot, now: float, settings: Settings) -> ValidationResult` (pure, no side effects).
+- Produces: `RejectedReason` enum (`OUT_OF_BOUNDS`,`NOT_ALLOWED`,`LIMIT_EXCEEDED`,`RATE_LIMITED`,`BUDGET_EXCEEDED`,`LOW_CONFIDENCE`); `ValidationResult` frozen dataclass with `accepted:bool` and `reason:RejectedReason|None`; `validate(decision: Decision, snapshot: StateSnapshot, now: float, settings: Settings) -> ValidationResult` (pure, no side effects).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -474,9 +475,10 @@ def test_rejects_key_not_in_allowlist():
     assert validate(_dec({"type":"press","key":"f13"}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
 
 def test_rate_limit_boundary():
-    # last action at t=10.0, min interval 0.2s -> 10.199 too soon, 10.2 ok
-    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.199, settings=SETTINGS).reason == RejectedReason.RATE_LIMITED
-    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.2, settings=SETTINGS).accepted
+    # last action at t=10.0, min interval 200ms. Use binary-exact deltas (0.125s, 0.25s)
+    # so the boundary assertion is not corrupted by float rounding.
+    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.125, settings=SETTINGS).reason == RejectedReason.RATE_LIMITED
+    assert validate(_dec({"type":"move","x":1,"y":1}), _snap(last=10.0), now=10.25, settings=SETTINGS).accepted
 
 def test_budget_boundary_off_by_one():
     assert validate(_dec({"type":"move","x":1,"y":1}), _snap(count=1), now=10.0, settings=SETTINGS).accepted
@@ -484,11 +486,11 @@ def test_budget_boundary_off_by_one():
 
 def test_hold_accumulation_guard():
     assert validate(_dec({"type":"hold","key":"w","duration_ms":500}), _snap(hold=500), now=10.0, settings=SETTINGS).accepted
-    assert validate(_dec({"type":"hold","key":"w","duration_ms":600}), _snap(hold=500), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
+    assert validate(_dec({"type":"hold","key":"w","duration_ms":600}), _snap(hold=500), now=10.0, settings=SETTINGS).reason == RejectedReason.LIMIT_EXCEEDED
 
 def test_wheel_delta_guard():
     assert validate(_dec({"type":"wheel","delta_y":100}), _snap(), now=10.0, settings=SETTINGS).accepted
-    assert validate(_dec({"type":"wheel","delta_y":101}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.NOT_ALLOWED
+    assert validate(_dec({"type":"wheel","delta_y":101}), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.LIMIT_EXCEEDED
 
 def test_low_confidence_rejected():
     assert validate(_dec({"type":"click","x":1,"y":1}, conf=0.4), _snap(), now=10.0, settings=SETTINGS).reason == RejectedReason.LOW_CONFIDENCE
@@ -505,7 +507,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'game_agent.validation'
 
 - [ ] **Step 3: Implement `validation.py`**
 
-Order of checks (first rejection wins): (1) `confidence < settings.confidence_threshold` → `LOW_CONFIDENCE`; (2) `done`/`uncertain` bypass all remaining checks and are accepted; (3) coordinate bounds for `click/move/drag/wheel` (wheel checks only `abs(delta)` ≤ `max_wheel_delta`, no position); (4) allowlist for `press/hold/release` keys and buttons; (5) duration guards (`wait` ≤ `max_wait_ms`, `hold` accumulated ≤ `max_hold_ms`); (6) rate limit (`last_action_at is None` passes, else `now - last_action_at >= min_action_interval_ms/1000`); (7) budget (`action_count >= max_actions_per_session` → `BUDGET_EXCEEDED`). Return `ValidationResult`. No mutation of `snapshot` or any global.
+Order of checks (first rejection wins): (1) `confidence < settings.confidence_threshold` → `LOW_CONFIDENCE`; (2) `done`/`uncertain` bypass all remaining checks and are accepted; (3) coordinate bounds for `click/move/drag` → `OUT_OF_BOUNDS` when any coordinate is `< 0` or `> viewport_*`; `wheel` instead checks `abs(delta) <= max_wheel_delta` and rejects with `LIMIT_EXCEEDED`; (4) allowlist for `press/hold/release` keys and buttons → `NOT_ALLOWED`; (5) duration guards (`wait` ≤ `max_wait_ms`, `hold` accumulated + this hold ≤ `max_hold_ms`) → `LIMIT_EXCEEDED`; (6) rate limit (`last_action_at is None` passes, else reject when `now - last_action_at < min_action_interval_ms / 1000`) → `RATE_LIMITED`; (7) budget (`action_count >= max_actions_per_session` → `BUDGET_EXCEEDED`). Return `ValidationResult`. No mutation of `snapshot` or any global.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -570,12 +572,18 @@ def test_failures_cap_forces_needs_user():
     m.transition(State.OBSERVING)  # human resumed
     assert m.state == State.OBSERVING
 
-def test_every_state_can_reach_a_terminal():
-    for s in State:
-        m = StateMachine()
-        assert m.can(State.OBSERVING) or s in (State.OBSERVING, State.STOPPED, State.DONE) or True
+def test_recovering_and_needs_user_have_exits():
     m = StateMachine()
-    assert m.can(State.STOPPED)  # from IDLE
+    for s in [State.OBSERVING, State.DECIDING, State.VALIDATING, State.ACTING, State.RECOVERING]:
+        m.transition(s)
+    assert m.can(State.OBSERVING)
+    assert m.can(State.NEEDS_USER)
+    assert m.can(State.STOPPED)
+
+def test_idle_can_reach_observing_and_stopped():
+    m = StateMachine()
+    assert m.can(State.OBSERVING)
+    assert m.can(State.STOPPED)
 
 def test_stop_is_terminal():
     m = StateMachine()
@@ -602,7 +610,7 @@ Encode the transition table from the spec exactly:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv\Scripts\python -m pytest tests/test_state.py -v`
-Expected: PASS (6 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Commit**
 
