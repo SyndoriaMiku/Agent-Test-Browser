@@ -5,6 +5,7 @@ per controller) and a held input ledger: the keys/buttons currently held down
 on the page.
 """
 
+import asyncio
 import contextlib
 import time
 import uuid
@@ -20,6 +21,7 @@ from playwright.async_api import (
 )
 
 from game_agent.config import Settings
+from game_agent.keys import to_playwright_key
 from game_agent.observation import Observation
 from game_agent.schema import (
     Action,
@@ -32,12 +34,24 @@ from game_agent.schema import (
     ReleaseAction,
     UncertainAction,
     WaitAction,
+    WheelAction,
 )
 from game_agent.session_state import Clock, MonotonicClock
 
 _NEXT_FRAME_SCRIPT = (
     "() => new Promise(resolve => requestAnimationFrame(() => resolve(true)))"
 )
+
+# A drag interpolates its path with one mouse move per this many
+# milliseconds of the requested duration, capped so a long drag cannot emit
+# an unbounded number of events.
+_DRAG_STEP_MS = 10
+_MAX_DRAG_STEPS = 100
+
+
+def _drag_steps(duration_ms: int) -> int:
+    """Return how many interpolated mouse moves a drag of *duration_ms* uses."""
+    return max(1, min(_MAX_DRAG_STEPS, round(duration_ms / _DRAG_STEP_MS)))
 
 
 class ControllerError(Exception):
@@ -122,8 +136,9 @@ class BrowserController:
 
     Owns one persistent Playwright browser context sized from ``Settings``:
     the screenshot and the pointer coordinates therefore share the same CSS
-    pixel space.  Tracks held keys/buttons internally: every hold leaves an
-    entry in a private ledger so ``release_all`` can always unwind them.
+    pixel space.  Tracks the pointer position and the held keys/buttons
+    internally: every hold leaves an entry in a private ledger so
+    ``release_all`` can always unwind them.
     """
 
     def __init__(
@@ -151,6 +166,22 @@ class BrowserController:
         self._page: Page | None = None
         self._held_keys: set[str] = set()
         self._held_buttons: set[str] = set()
+        # The pointer starts at the centre of the viewport so a wheel action
+        # never scrolls at (0, 0).
+        self._cursor: tuple[int, int] = (
+            self._settings.viewport_width // 2,
+            self._settings.viewport_height // 2,
+        )
+
+    @property
+    def held_keys(self) -> frozenset[str]:
+        """The keys currently held down, as a read-only snapshot."""
+        return frozenset(self._held_keys)
+
+    @property
+    def held_buttons(self) -> frozenset[str]:
+        """The mouse buttons currently held down, as a read-only snapshot."""
+        return frozenset(self._held_buttons)
 
     @property
     def page(self) -> Page:
@@ -240,41 +271,145 @@ class BrowserController:
     async def execute(self, action: Action) -> None:
         """Dispatch a schema-valid :class:`Action` to the game page.
 
+        The action is first checked against the controller's own policy
+        (:func:`assert_executable`) and only then performed.  ``hold`` and
+        ``drag`` are atomic: once the input is down it is released in a
+        ``finally`` block, so a failure during the hold never leaves it
+        stuck; the ledger keeps it tracked until a release actually
+        succeeded, so ``release_all`` can retry it later.
+
         Args:
             action: The validated action to perform.
 
         Raises:
-            NotImplementedError: Until the M1 executor lands.
+            ActionNotAllowed: If the action violates the configured policy
+                (terminal reports included).
+            ControllerError: If the browser is not open yet.
         """
-        raise NotImplementedError("Milestone 1: BrowserController.execute")
+        assert_executable(action, self._settings)
+        page = self.page
+
+        if isinstance(action, ClickAction):
+            await page.mouse.click(
+                action.x,
+                action.y,
+                button=action.button.value,
+                click_count=action.click_count,
+            )
+            self._cursor = (action.x, action.y)
+        elif isinstance(action, MoveAction):
+            await page.mouse.move(action.x, action.y)
+            self._cursor = (action.x, action.y)
+        elif isinstance(action, PressAction):
+            await page.keyboard.press(to_playwright_key(action.key))
+        elif isinstance(action, HoldAction):
+            await self._hold(action)
+        elif isinstance(action, ReleaseAction):
+            await self._release(action)
+        elif isinstance(action, DragAction):
+            await self._drag(action)
+        elif isinstance(action, WheelAction):
+            await page.mouse.move(*self._cursor)
+            await page.mouse.wheel(action.delta_x, action.delta_y)
+        elif isinstance(action, WaitAction):
+            await asyncio.sleep(action.duration_ms / 1000)
+        else:  # pragma: no cover - assert_executable rejects reports first
+            raise ActionNotAllowed(f"action type {action.type!r} is not executable")
+
+    async def _hold(self, action: HoldAction) -> None:
+        """Hold the action's key or button down, then release it again."""
+        if action.key is not None:
+            await self._hold_key(action.key)
+            try:
+                await asyncio.sleep(action.duration_ms / 1000)
+            finally:
+                await self._release_key(action.key)
+            return
+
+        button = action.button
+        if button is None:  # pragma: no cover - the schema demands one target
+            raise ActionNotAllowed("hold action names neither a key nor a button")
+        await self._hold_button(button.value)
+        try:
+            await asyncio.sleep(action.duration_ms / 1000)
+        finally:
+            await self._release_button(button.value)
+
+    async def _release(self, action: ReleaseAction) -> None:
+        """Release the action's key or button; a no-op when it is not held."""
+        if action.key is not None:
+            if action.key in self._held_keys:
+                await self._release_key(action.key)
+            return
+
+        button = action.button
+        if button is None:  # pragma: no cover - the schema demands one target
+            raise ActionNotAllowed("release action names neither a key nor a button")
+        if button.value in self._held_buttons:
+            await self._release_button(button.value)
+
+    async def _drag(self, action: DragAction) -> None:
+        """Drag from the start point to the end point along an interpolated path."""
+        page = self.page
+        await page.mouse.move(action.start_x, action.start_y)
+        self._cursor = (action.start_x, action.start_y)
+        await self._hold_button(action.button.value)
+        try:
+            await page.mouse.move(
+                action.end_x,
+                action.end_y,
+                steps=_drag_steps(action.duration_ms),
+            )
+            self._cursor = (action.end_x, action.end_y)
+        finally:
+            await self._release_button(action.button.value)
+
+    async def _hold_key(self, key: str) -> None:
+        """Press *key* down and track it in the held-key ledger.
+
+        The key enters the ledger *before* the browser is asked to press it,
+        so even a failed press leaves an entry for ``release_all`` to clean
+        up.
+        """
+        self._held_keys.add(key)
+        await self.page.keyboard.down(to_playwright_key(key))
+
+    async def _release_key(self, key: str) -> None:
+        """Release *key* and drop it from the ledger once the browser is up."""
+        await self.page.keyboard.up(to_playwright_key(key))
+        self._held_keys.discard(key)
+
+    async def _hold_button(self, button: str) -> None:
+        """Press mouse *button* down and track it in the held-button ledger."""
+        self._held_buttons.add(button)
+        await self.page.mouse.down(button=button)
+
+    async def _release_button(self, button: str) -> None:
+        """Release mouse *button* and drop it once the browser is up."""
+        await self.page.mouse.up(button=button)
+        self._held_buttons.discard(button)
 
     async def release_all(self) -> None:
         """Release every held key/button and empty the held-input ledger.
 
         Safe-recovery primitive the agent loop calls from ``RECOVERING``:
         it releases each key or button the ledger still lists so recovery
-        never leaves inputs stuck down.  Releases are best-effort: an entry
-        whose release failed stays in the ledger for the next attempt.
+        never leaves inputs stuck down.  Releases are best-effort: a failing
+        release is swallowed so one bad input cannot block the others, and
+        its ledger entry stays for the next attempt.
         """
-        page = self._page
+        if self._page is None:
+            # Nothing can be held down in a browser that is not running.
+            self._held_keys.clear()
+            self._held_buttons.clear()
+            return
+
         for key in list(self._held_keys):
-            if page is None:
-                self._held_keys.discard(key)
-                continue
-            try:
-                await page.keyboard.up(key)
-            except PlaywrightError:
-                continue
-            self._held_keys.discard(key)
+            with contextlib.suppress(Exception):
+                await self._release_key(key)
         for button in list(self._held_buttons):
-            if page is None:
-                self._held_buttons.discard(button)
-                continue
-            try:
-                await page.mouse.up(button)
-            except PlaywrightError:
-                continue
-            self._held_buttons.discard(button)
+            with contextlib.suppress(Exception):
+                await self._release_button(button)
 
     async def close(self) -> None:
         """Shut the browser down cleanly.

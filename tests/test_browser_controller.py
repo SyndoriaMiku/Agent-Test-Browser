@@ -11,13 +11,28 @@ message instead of failing, so a fresh checkout is never red.
 
 import pathlib
 import struct
+import time
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
 
 from game_agent.config import Settings
-from game_agent.controller import BrowserController, BrowserOptions
+from game_agent.controller import (
+    ActionNotAllowed,
+    BrowserController,
+    BrowserOptions,
+)
 from game_agent.observation import Observation
+from game_agent.schema import (
+    ClickAction,
+    DragAction,
+    HoldAction,
+    MoveAction,
+    PressAction,
+    ReleaseAction,
+    WaitAction,
+    WheelAction,
+)
 
 pytestmark = pytest.mark.browser
 DEMO = pathlib.Path(__file__).resolve().parents[1] / "examples" / "demo.html"
@@ -130,3 +145,144 @@ async def test_demo_records_last_key(controller):
     await controller.page.keyboard.press("a")
     state = await controller.page.evaluate("window.__demoState")
     assert state["lastKey"] == "a"
+
+
+async def test_click_hits_demo_target(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.execute(ClickAction(type="click", x=180, y=130))
+    state = await controller.page.evaluate("window.__demoState")
+    assert state["clicks"] == 1
+
+
+async def test_press_translates_agent_key(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.execute(PressAction(type="press", key="up"))
+    state = await controller.page.evaluate("window.__demoState")
+    assert state["lastKey"] == "ArrowUp"
+
+
+async def test_hold_leaves_no_stuck_input(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.execute(HoldAction(type="hold", key="w", duration_ms=50))
+    assert controller.held_keys == frozenset()
+
+
+async def test_release_all_clears_after_failed_up(controller, monkeypatch):
+    await controller.goto(DEMO.as_uri())
+    calls = {"n": 0}
+    real = controller._release_key
+
+    async def flaky(key):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        await real(key)
+
+    monkeypatch.setattr(controller, "_release_key", flaky)
+    with pytest.raises(Exception):
+        await controller.execute(HoldAction(type="hold", key="w", duration_ms=50))
+    assert controller.held_keys == frozenset({"w"})   # still tracked
+    await controller.release_all()
+    assert controller.held_keys == frozenset()        # cleared
+
+
+async def test_execute_rejects_done(controller):
+    from game_agent.schema import DoneAction
+    with pytest.raises(ActionNotAllowed):
+        await controller.execute(DoneAction(type="done", summary="x"))
+
+
+async def test_release_all_survives_one_failing_release(controller, monkeypatch):
+    await controller.goto(DEMO.as_uri())
+    await controller._hold_key("w")
+    await controller._hold_key("a")
+    real = controller._release_key
+
+    async def flaky(key):
+        if key == "w":
+            raise RuntimeError("boom")
+        await real(key)
+
+    monkeypatch.setattr(controller, "_release_key", flaky)
+    await controller.release_all()
+    assert controller.held_keys == frozenset({"w"})   # the failed one stays
+    assert controller.held_buttons == frozenset()
+
+
+async def test_hold_button_leaves_no_stuck_button(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.execute(HoldAction(type="hold", button="left", duration_ms=50))
+    assert controller.held_buttons == frozenset()
+
+
+async def test_release_is_idempotent_when_nothing_is_held(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.execute(ReleaseAction(type="release", key="w"))
+    await controller.execute(ReleaseAction(type="release", button="left"))
+    assert controller.held_keys == frozenset()
+    assert controller.held_buttons == frozenset()
+
+
+async def test_move_moves_the_pointer(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.page.evaluate(
+        "() => { window.__moves = [];"
+        " document.addEventListener('mousemove',"
+        " e => window.__moves.push([e.clientX, e.clientY])); }"
+    )
+    await controller.execute(MoveAction(type="move", x=123, y=45))
+    # Pointer moves reach the page asynchronously; wait for the event.
+    await controller.page.wait_for_function("() => window.__moves.length > 0")
+    moves = await controller.page.evaluate("window.__moves")
+    assert moves[-1] == [123, 45]
+
+
+async def test_drag_presses_and_releases_through_the_ledger(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.page.evaluate(
+        "() => { window.__events = [];"
+        " document.addEventListener('mousedown', () => window.__events.push(['down']));"
+        " document.addEventListener('mouseup', () => window.__events.push(['up']));"
+        " document.addEventListener('mousemove',"
+        " e => window.__events.push(['move', e.clientX, e.clientY])); }"
+    )
+    await controller.execute(
+        DragAction(type="drag", start_x=100, start_y=100,
+                   end_x=300, end_y=200, duration_ms=50)
+    )
+    # Pointer moves reach the page asynchronously; wait for the release.
+    await controller.page.wait_for_function(
+        "() => window.__events.some(e => e[0] === 'up')"
+    )
+    events = await controller.page.evaluate("window.__events")
+    moves = [e for e in events if e[0] == "move"]
+    assert events[0] == ["move", 100, 100]   # the pointer travels to the start
+    assert ["down"] in events
+    assert events[-1] == ["up"]
+    assert len(moves) >= 2            # interpolated, not a single jump
+    assert moves[-1] == ["move", 300, 200]
+    assert controller.held_buttons == frozenset()
+
+
+async def test_wheel_scrolls_at_the_tracked_cursor(controller):
+    await controller.goto(DEMO.as_uri())
+    await controller.page.evaluate("document.body.style.height = '3000px'")
+    await controller.page.evaluate(
+        "() => { window.__wheel = [];"
+        " document.addEventListener('wheel',"
+        " e => window.__wheel.push([e.deltaX, e.deltaY])); }"
+    )
+    await controller.execute(MoveAction(type="move", x=640, y=360))
+    await controller.execute(WheelAction(type="wheel", delta_y=300))
+    # The wheel event reaches the page asynchronously; wait for it.
+    await controller.page.wait_for_function("() => window.__wheel.length > 0")
+    wheel = await controller.page.evaluate("window.__wheel")
+    assert wheel[-1] == [0, 300]
+    assert await controller.page.evaluate("window.scrollY") > 0
+
+
+async def test_wait_action_waits_for_the_requested_duration(controller):
+    await controller.goto(DEMO.as_uri())
+    started = time.monotonic()
+    await controller.execute(WaitAction(type="wait", duration_ms=50))
+    assert time.monotonic() - started >= 0.05
