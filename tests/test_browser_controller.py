@@ -18,6 +18,7 @@ from playwright.async_api import Error as PlaywrightError
 
 from game_agent.config import Settings
 from game_agent.controller import (
+    ActionExecutionError,
     ActionNotAllowed,
     BrowserController,
     BrowserOptions,
@@ -63,25 +64,49 @@ def _png_size(path: str) -> tuple[int, int]:
 
 
 @pytest.fixture
-async def controller(tmp_path):
-    opts = BrowserOptions(headless=True, user_data_dir=str(tmp_path / "profile"),
-                          screenshot_dir=str(tmp_path / "shots"))
-    c = BrowserController(Settings(), options=opts)
+async def controller_factory(tmp_path):
+    """Yield a factory that opens real controllers for the test.
+
+    The factory takes the :class:`Settings` the controller should run with,
+    so a test can build a controller whose policy allows something the
+    browser itself rejects.  Every controller it opens is closed again when
+    the test ends.
+    """
+    opened: list[BrowserController] = []
+
+    async def make(settings: Settings | None = None) -> BrowserController:
+        index = len(opened)
+        opts = BrowserOptions(
+            headless=True,
+            user_data_dir=str(tmp_path / f"profile-{index}"),
+            screenshot_dir=str(tmp_path / f"shots-{index}"),
+        )
+        c = BrowserController(Settings() if settings is None else settings,
+                              options=opts)
+        try:
+            await c.open()
+        except PlaywrightError as exc:
+            await _close_quietly(c)
+            if _is_missing_executable(exc):
+                reason = str(exc).splitlines()[0]
+                pytest.skip(
+                    f"Chromium is not installed for Playwright: {reason}. "
+                    "Run `.venv\\Scripts\\python -m playwright install chromium`."
+                )
+            raise
+        opened.append(c)
+        return c
+
     try:
-        await c.open()
-    except PlaywrightError as exc:
-        await _close_quietly(c)
-        if _is_missing_executable(exc):
-            reason = str(exc).splitlines()[0]
-            pytest.skip(
-                f"Chromium is not installed for Playwright: {reason}. "
-                "Run `.venv\\Scripts\\python -m playwright install chromium`."
-            )
-        raise
-    try:
-        yield c
+        yield make
     finally:
-        await c.close()
+        for c in opened:
+            await c.close()
+
+
+@pytest.fixture
+async def controller(controller_factory):
+    return await controller_factory()
 
 
 async def test_screenshot_dimensions(controller):
@@ -179,8 +204,11 @@ async def test_release_all_clears_after_failed_up(controller, monkeypatch):
         await real(key)
 
     monkeypatch.setattr(controller, "_release_key", flaky)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as excinfo:
         await controller.execute(HoldAction(type="hold", key="w", duration_ms=50))
+    # Only Playwright errors are wrapped; this injected RuntimeError is not.
+    assert isinstance(excinfo.value, RuntimeError)
+    assert not isinstance(excinfo.value, ActionExecutionError)
     assert controller.held_keys == frozenset({"w"})   # still tracked
     await controller.release_all()
     assert controller.held_keys == frozenset()        # cleared
@@ -286,3 +314,18 @@ async def test_wait_action_waits_for_the_requested_duration(controller):
     started = time.monotonic()
     await controller.execute(WaitAction(type="wait", duration_ms=50))
     assert time.monotonic() - started >= 0.05
+
+
+async def test_execute_wraps_browser_failure_in_action_execution_error(
+    controller_factory,
+):
+    """A Playwright failure must surface as ActionExecutionError."""
+    c = await controller_factory(Settings(allowed_keys=frozenset({"f13"})))
+    await c.goto(DEMO.as_uri())
+    with pytest.raises(ActionExecutionError) as excinfo:
+        await c.execute(PressAction(type="press", key="f13"))
+    # The raw Playwright error must not escape, but it is kept as the cause.
+    assert not isinstance(excinfo.value, PlaywrightError)
+    assert isinstance(excinfo.value.__cause__, PlaywrightError)
+    # A failed press leaves no held input behind.
+    assert c.held_keys == frozenset()

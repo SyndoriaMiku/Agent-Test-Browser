@@ -278,43 +278,54 @@ class BrowserController:
         stuck; the ledger keeps it tracked until a release actually
         succeeded, so ``release_all`` can retry it later.
 
+        A failure of the browser itself is reported as
+        :class:`ActionExecutionError` (with the Playwright error as its
+        cause), so an agent loop can catch the whole controller error
+        contract with one ``except ControllerError``.
+
         Args:
             action: The validated action to perform.
 
         Raises:
             ActionNotAllowed: If the action violates the configured policy
                 (terminal reports included).
+            ActionExecutionError: If the browser interaction failed.
             ControllerError: If the browser is not open yet.
         """
         assert_executable(action, self._settings)
         page = self.page
 
-        if isinstance(action, ClickAction):
-            await page.mouse.click(
-                action.x,
-                action.y,
-                button=action.button.value,
-                click_count=action.click_count,
-            )
-            self._cursor = (action.x, action.y)
-        elif isinstance(action, MoveAction):
-            await page.mouse.move(action.x, action.y)
-            self._cursor = (action.x, action.y)
-        elif isinstance(action, PressAction):
-            await page.keyboard.press(to_playwright_key(action.key))
-        elif isinstance(action, HoldAction):
-            await self._hold(action)
-        elif isinstance(action, ReleaseAction):
-            await self._release(action)
-        elif isinstance(action, DragAction):
-            await self._drag(action)
-        elif isinstance(action, WheelAction):
-            await page.mouse.move(*self._cursor)
-            await page.mouse.wheel(action.delta_x, action.delta_y)
-        elif isinstance(action, WaitAction):
-            await asyncio.sleep(action.duration_ms / 1000)
-        else:  # pragma: no cover - assert_executable rejects reports first
-            raise ActionNotAllowed(f"action type {action.type!r} is not executable")
+        try:
+            if isinstance(action, ClickAction):
+                await page.mouse.click(
+                    action.x,
+                    action.y,
+                    button=action.button.value,
+                    click_count=action.click_count,
+                )
+                self._cursor = (action.x, action.y)
+            elif isinstance(action, MoveAction):
+                await page.mouse.move(action.x, action.y)
+                self._cursor = (action.x, action.y)
+            elif isinstance(action, PressAction):
+                await page.keyboard.press(to_playwright_key(action.key))
+            elif isinstance(action, HoldAction):
+                await self._hold(action)
+            elif isinstance(action, ReleaseAction):
+                await self._release(action)
+            elif isinstance(action, DragAction):
+                await self._drag(action)
+            elif isinstance(action, WheelAction):
+                await page.mouse.move(*self._cursor)
+                await page.mouse.wheel(action.delta_x, action.delta_y)
+            elif isinstance(action, WaitAction):
+                await asyncio.sleep(action.duration_ms / 1000)
+            else:  # pragma: no cover - assert_executable rejects reports first
+                raise ActionNotAllowed(f"action type {action.type!r} is not executable")
+        except PlaywrightError as exc:
+            raise ActionExecutionError(
+                f"browser interaction failed while executing {action.type!r}: {exc}"
+            ) from exc
 
     async def _hold(self, action: HoldAction) -> None:
         """Hold the action's key or button down, then release it again."""
