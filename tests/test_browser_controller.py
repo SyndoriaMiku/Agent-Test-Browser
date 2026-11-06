@@ -16,6 +16,7 @@ import time
 import pytest
 from playwright.async_api import Error as PlaywrightError
 
+import game_agent.controller as controller_module
 from game_agent.config import Settings
 from game_agent.controller import (
     ActionExecutionError,
@@ -107,6 +108,48 @@ async def controller_factory(tmp_path):
 @pytest.fixture
 async def controller(controller_factory):
     return await controller_factory()
+
+
+async def test_open_failure_closes_context_and_stops_playwright(monkeypatch):
+    """A page-acquisition failure must not leak the browser resources."""
+    closed: list[str] = []
+    stopped: list[str] = []
+
+    class FakeContext:
+        pages: list = []
+
+        async def new_page(self):
+            raise RuntimeError("no page for you")
+
+        async def close(self):
+            closed.append("context")
+
+    class FakeChromium:
+        async def launch_persistent_context(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def stop(self):
+            stopped.append("playwright")
+
+    class FakeAsyncPlaywright:
+        async def start(self):
+            return FakePlaywright()
+
+    monkeypatch.setattr(controller_module, "async_playwright", FakeAsyncPlaywright)
+
+    controller = BrowserController(Settings())
+    with pytest.raises(RuntimeError, match="no page for you"):
+        await controller.open()
+    # The launched context and the started Playwright are both released.
+    assert closed == ["context"]
+    assert stopped == ["playwright"]
+    # The controller stays closed, so a retry would start from scratch.
+    assert controller._context is None
+    assert controller._page is None
+    assert controller._playwright is None
 
 
 async def test_screenshot_dimensions(controller):
@@ -306,6 +349,9 @@ async def test_wheel_scrolls_at_the_tracked_cursor(controller):
     await controller.page.wait_for_function("() => window.__wheel.length > 0")
     wheel = await controller.page.evaluate("window.__wheel")
     assert wheel[-1] == [0, 300]
+    # Chromium commits the scroll in the compositor after the main thread
+    # acks the wheel event, so the scroll position is not readable yet.
+    await controller.page.wait_for_function("() => window.scrollY > 0")
     assert await controller.page.evaluate("window.scrollY") > 0
 
 

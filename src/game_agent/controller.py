@@ -210,6 +210,7 @@ class BrowserController:
             raise ControllerError("browser is already open")
 
         playwright = await async_playwright().start()
+        context: BrowserContext | None = None
         try:
             context = await playwright.chromium.launch_persistent_context(
                 self._options.user_data_dir,
@@ -221,16 +222,23 @@ class BrowserController:
                 device_scale_factor=self._settings.device_scale_factor,
                 channel=self._options.browser_channel,
             )
+            pages = context.pages
+            page = pages[0] if pages else await context.new_page()
+            self._playwright = playwright
+            self._context = context
+            self._page = page
         except BaseException:
+            # The context may already be running: close it and stop
+            # Playwright before the original error leaves ``open()``.
+            with contextlib.suppress(Exception):
+                if context is not None:
+                    await context.close()
             with contextlib.suppress(Exception):
                 await playwright.stop()
+            self._playwright = None
+            self._context = None
+            self._page = None
             raise
-
-        pages = context.pages
-        page = pages[0] if pages else await context.new_page()
-        self._playwright = playwright
-        self._context = context
-        self._page = page
 
     async def goto(self, url: str) -> None:
         """Navigate the current page to *url* and wait for the load event.

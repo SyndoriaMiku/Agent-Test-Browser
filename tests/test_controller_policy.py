@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 from game_agent.config import Settings
 from game_agent.controller import (ActionExecutionError, ActionNotAllowed,
@@ -13,7 +15,7 @@ def test_options_defaults_and_frozen():
     o = BrowserOptions()
     assert o.headless is False
     assert o.user_data_dir == ".browser-profile"
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         o.headless = True  # type: ignore[misc]
 
 def test_exception_hierarchy():
