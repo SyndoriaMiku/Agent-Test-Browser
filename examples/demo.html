@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Game Agent demo page</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #101418;
+    color: #e8eef5;
+    font-family: system-ui, sans-serif;
+  }
+
+  /* The click target the agent aims at. Its box is exactly 160x60 at
+     viewport (100, 100), so its centre is the known coordinate (180, 130). */
+  #start {
+    position: absolute;
+    left: 100px;
+    top: 100px;
+    width: 160px;
+    height: 60px;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    cursor: pointer;
+  }
+
+  #log {
+    position: absolute;
+    left: 100px;
+    top: 180px;
+  }
+</style>
+</head>
+<body>
+<button id="start" type="button">Start</button>
+<div id="log">clicks=0</div>
+<script>
+  window.__demoState = { clicks: 0, lastKey: null };
+
+  const start = document.getElementById("start");
+  const log = document.getElementById("log");
+
+  start.addEventListener("click", () => {
+    window.__demoState.clicks += 1;
+    log.textContent = "clicks=" + window.__demoState.clicks;
+    start.dataset.clicks = String(window.__demoState.clicks);
+  });
+
+  window.addEventListener("keydown", (event) => {
+    window.__demoState.lastKey = event.key;
+  });
+</script>
+</body>
+</html>
