@@ -1,12 +1,13 @@
 import inspect
 import pytest
+from game_agent.config import Settings
 from game_agent.controller import BrowserController
 from game_agent.vlm import VLMClient
 from game_agent.observation import Observation
 from game_agent.schema import ClickAction
 
 def test_controller_methods_are_async_and_raise():
-    c = BrowserController()
+    c = BrowserController(Settings())
     assert inspect.iscoroutinefunction(c.open)
     assert inspect.iscoroutinefunction(c.execute)
     assert inspect.iscoroutinefunction(c.release_all)
@@ -14,7 +15,7 @@ def test_controller_methods_are_async_and_raise():
 
 async def test_controller_execute_not_implemented():
     with pytest.raises(NotImplementedError):
-        await BrowserController().execute(ClickAction(type="click", x=1, y=1))
+        await BrowserController(Settings()).execute(ClickAction(type="click", x=1, y=1))
 
 async def test_vlm_decide_not_implemented():
     obs = Observation(observation_id="o", screenshot_path=None, viewport_width=1,

@@ -128,20 +128,20 @@ class BrowserController:
 
     def __init__(
         self,
-        settings: Settings | None = None,
+        settings: Settings,
         options: BrowserOptions | None = None,
         clock: Clock | None = None,
     ) -> None:
         """Store the configuration; nothing is launched until :meth:`open`.
 
         Args:
-            settings: Viewport geometry and policy limits; defaults to the
-                built-in :class:`Settings` values.
+            settings: Viewport geometry and policy limits — the single source
+                of truth for the browser's size.
             options: Browser launch options; defaults to :class:`BrowserOptions`.
             clock: Time source for observation timestamps; defaults to a
                 monotonic clock.
         """
-        self._settings = Settings() if settings is None else settings
+        self._settings = settings
         self._options = BrowserOptions() if options is None else options
         self._clock: Clock = MonotonicClock() if clock is None else clock
         self._session_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
