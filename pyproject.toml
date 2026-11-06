@@ -18,3 +18,5 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-m \"not browser\""
+markers = ["browser: real-browser tests (opt-in; run with -m browser)"]
