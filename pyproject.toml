@@ -7,7 +7,7 @@ name = "game-agent"
 version = "0.1.0"
 description = "Visual browser game AI agent"
 requires-python = ">=3.14"
-dependencies = ["playwright", "pydantic>=2", "python-dotenv"]
+dependencies = ["playwright", "pydantic>=2", "python-dotenv", "pillow"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
