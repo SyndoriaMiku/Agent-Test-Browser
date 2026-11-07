@@ -7,13 +7,14 @@ and logs every step as JSONL for replay and debugging.
 
 ## Current status
 
-**Milestone 1 — the browser controller — is implemented.** The safety-critical core (action schema,
-action validator, state machine, session state, JSONL logging, configuration) is joined by a real
-Playwright async controller: it opens a persistent Chromium context, navigates, screenshots, and
-executes schema-validated actions inside the safety envelope, tracking held keys/buttons so
-`release_all` can unwind them — best-effort; a failed release stays in the ledger for retry. Still pending: the VLM client (M2) — `vlm.py` remains an
-async stub that raises `NotImplementedError` — and the session loop driver (M3) that wires
-observe → decide → act → verify together (see [docs/roadmap.md](docs/roadmap.md)).
+**Milestones 1 and 2 — the browser controller and the VLM client — are implemented.** The
+safety-critical core (action schema, action validator, state machine, session state, JSONL logging,
+configuration) is joined by a real Playwright async controller: it opens a persistent Chromium
+context, navigates, screenshots, and executes schema-validated actions inside the safety envelope,
+tracking held keys/buttons so `release_all` can unwind them — best-effort; a failed release stays in
+the ledger for retry. The real vision-model client ([Vision model (M2)](#vision-model-m2)) turns a
+screenshot plus a goal into a schema-valid `Decision`. Still pending: the session loop driver (M3)
+that wires observe → decide → act → verify together (see [docs/roadmap.md](docs/roadmap.md)).
 
 ## Install
 
@@ -27,8 +28,8 @@ python -m venv .venv
 ## Run tests
 
 The default suite is offline and deterministic: no network, no API keys, no `sleep` — cross-action timing
-is driven by an injected fake clock. Real-browser tests exist but are opt-in (see
-[Browser PoC](#browser-poc)).
+is driven by an injected fake clock. Real-browser and real-model tests exist but are opt-in (see
+[Browser PoC](#browser-poc) and [Vision model (M2)](#vision-model-m2)).
 
 ```powershell
 .venv\Scripts\python -m pytest
@@ -50,10 +51,40 @@ Run the browser tests (they exercise the controller, mostly against [examples/de
 .venv\Scripts\python -m pytest -m browser
 ```
 
-- **The default suite stays offline.** `pyproject.toml` sets `addopts = -m "not browser"`, so a
-  plain `pytest` filters the browser tests out unless you ask for them with `-m browser`.
+- **The default suite stays offline.** `pyproject.toml` sets `addopts = -m "not browser and not live"`,
+  so a plain `pytest` filters the browser tests out unless you ask for them with `-m browser`.
 - **Missing Chromium skips, not fails.** If the browser binary is not installed, the browser tests
   skip with a clear message pointing at the install command above — a fresh checkout is never red.
+
+## Vision model (M2)
+
+`VLMClient.decide` sends the screenshot plus the goal to an OpenAI-compatible `chat/completions`
+endpoint and returns a schema-valid `Decision` — never arbitrary code. Model output that cannot be
+parsed is repaired once and then reported as a terminal `uncertain` decision.
+
+Configuration comes from `NVIDIA_*` variables, read by `load_vlm_config` (`src/game_agent/vlm.py`):
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `NVIDIA_API_KEY` | yes | Bearer key for the endpoint; never logged or written to disk |
+| `NVIDIA_MODEL` | yes | Model name sent as the request's `model` field |
+| `NVIDIA_BASE_URL` | no | OpenAI-compatible base URL; defaults to `https://integrate.api.nvidia.com/v1` |
+| `NVIDIA_TIMEOUT_S` / `NVIDIA_MAX_TOKENS` / `NVIDIA_TEMPERATURE` | no | Per-call limits, defaulting to 60 s / 512 tokens / 0.0 |
+
+- **`.env` is read.** `load_vlm_config` loads [`.env`](.env.example) via `python-dotenv` and merges
+  it *beneath* the process environment (shell variables win); `os.environ` is never mutated. Copy
+  `.env.example` to `.env` and fill in the key — and never commit `.env`.
+- **The live test is opt-in.** [tests/test_vlm_live.py](tests/test_vlm_live.py) drives the real
+  browser to [examples/demo.html](examples/demo.html), screenshots it, and calls the real API
+  (install Chromium first — see [Browser PoC](#browser-poc)):
+
+  ```powershell
+  .venv\Scripts\python -m pytest -m "live and browser" -v
+  ```
+
+  It skips unless both `NVIDIA_API_KEY` and `NVIDIA_MODEL` are set in the environment.
+- **The default suite stays offline.** The `live` marker is filtered out by the same `addopts` as
+  the `browser` marker, so a plain `pytest` never touches the network or your API key.
 
 ## Configuration
 
@@ -72,7 +103,8 @@ $env:GAME_AGENT_VIEWPORT_WIDTH = "1920"
 - **`.env` is not auto-loaded yet.** `load_settings` reads `os.environ` only — there is no dotenv
   loading. [`.env.example`](.env.example) documents the variable names for that planned
   auto-load (`python-dotenv` is already a declared dependency for it), but copying it to `.env`
-  today has no effect; set the variables in your shell instead.
+  today has no effect on `Settings`; set the variables in your shell instead. (The VLM
+  configuration *does* read `.env` — see [Vision model (M2)](#vision-model-m2).)
 
 ## Module map (`src/game_agent`)
 
@@ -87,7 +119,7 @@ $env:GAME_AGENT_VIEWPORT_WIDTH = "1920"
 | `logging.py` | `SessionLogger` — one JSON object per line, records linked by `observation_id`; never writes secrets |
 | `keys.py` | `to_playwright_key` — pure translation from agent key names (`up`, `space`, …) to Playwright key names (`ArrowUp`, `Space`, …); single characters and unknown names pass through unchanged, so a bad name surfaces as a Playwright error |
 | `controller.py` | `BrowserController` — the real async Playwright executor (M1): owns the browser lifecycle (`open`/`close`, one persistent Chromium context sized from `Settings`), `goto`, `screenshot` → `Observation`, and `execute`, which gates every action through `assert_executable` before dispatch. A held-input ledger (`held_keys`/`held_buttons`) backs the safe `release_all` recovery primitive; during `execute`, Playwright failures are wrapped as `ActionExecutionError` (policy violations raise `ActionNotAllowed`), so one `except ControllerError` covers the whole `execute` contract |
-| `vlm.py` | `VLMClient` — async stub for the vision model client (M2); must return a schema-valid `Decision`, never arbitrary code |
+| `vlm.py` | `VLMClient` + `load_vlm_config` — the real vision-model client (M2): turns a screenshot data URL plus goal into chat messages, POSTs them to an OpenAI-compatible `chat/completions` endpoint, and parses the reply into a schema-valid `Decision` (never arbitrary code); unparseable output is repaired once, then reported as a terminal `uncertain` decision; `NVIDIA_*` env/`.env` configuration (see [Vision model (M2)](#vision-model-m2)) |
 
 ## Documentation
 
