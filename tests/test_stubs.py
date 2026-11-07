@@ -2,7 +2,7 @@ import inspect
 import pytest
 from game_agent.config import Settings
 from game_agent.controller import BrowserController, ControllerError
-from game_agent.vlm import VLMClient
+from game_agent.vlm import VLMClient, VLMError
 from game_agent.observation import Observation
 from game_agent.schema import ClickAction
 
@@ -17,10 +17,12 @@ async def test_controller_execute_needs_an_open_browser():
     with pytest.raises(ControllerError):
         await BrowserController(Settings()).execute(ClickAction(type="click", x=1, y=1))
 
-async def test_vlm_decide_not_implemented():
+async def test_vlm_decide_reports_missing_configuration():
+    # The VLM client is implemented (M2): a missing key/model or screenshot is
+    # a VLMError, not the old NotImplementedError stub.
     obs = Observation(observation_id="o", screenshot_path=None, viewport_width=1,
                       viewport_height=1, device_scale_factor=1.0, timestamp=0.0)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(VLMError):
         await VLMClient().decide(obs, goal="win", remaining_actions=10)
 
 def test_release_all_documented_contract():

@@ -1,17 +1,23 @@
 """VLM configuration and client: observation plus goal to one decision.
 
 The client returns structured decisions only; it never emits or runs
-arbitrary code. Concrete model integration arrives in Milestone 2.
+arbitrary code. Model output that cannot be parsed is repaired once and
+then reported as an ``uncertain`` decision.
 """
 
+import asyncio
 import base64
+import http.client
 import json
 import os
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import dotenv_values
+from pydantic import ValidationError
 
 from game_agent.observation import Observation
 from game_agent.schema import Decision, UncertainAction
@@ -232,8 +238,154 @@ def fallback_decision(observation_id: str, error: str) -> Decision:
     )
 
 
+def _post_json(
+    url: str,
+    headers: Mapping[str, str],
+    payload: Mapping[str, object],
+    timeout_s: float,
+) -> dict:
+    """POST *payload* as JSON to *url* with the standard library.
+
+    Args:
+        url: The endpoint URL.
+        headers: Request headers (including the authorization header).
+        payload: The JSON-serializable request body.
+        timeout_s: Socket timeout in seconds.
+
+    Returns:
+        The decoded JSON response body.
+
+    Raises:
+        VLMError: On a non-2xx status, a network failure, or a body that
+            is not a JSON object. The message never contains the key.
+    """
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers=dict(headers), method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise VLMError(f"model endpoint returned HTTP {exc.code}") from None
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        raise VLMError(f"model endpoint request failed: {exc}") from None
+    if not 200 <= int(status) < 300:
+        raise VLMError(f"model endpoint returned HTTP {status}")
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise VLMError("model endpoint returned a body that is not JSON") from None
+    if not isinstance(parsed, dict):
+        raise VLMError("model endpoint returned a JSON body that is not an object")
+    return parsed
+
+
+def _extract_content(response: object) -> str:
+    """Pull the assistant text out of an OpenAI-compatible chat response.
+
+    Args:
+        response: The decoded response body.
+
+    Returns:
+        The message content as a non-empty string.
+
+    Raises:
+        VLMError: If the body has no usable content string.
+    """
+    if not isinstance(response, Mapping):
+        raise VLMError("model endpoint returned an unexpected response shape")
+    choices = response.get("choices")
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise VLMError("model endpoint returned no choices")
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        raise VLMError("model endpoint returned an unexpected choice shape")
+    message = choice.get("message")
+    if not isinstance(message, Mapping):
+        raise VLMError("model endpoint returned a choice without a message")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise VLMError("model endpoint returned no usable content")
+    return content
+
+
+def _repair_instruction(error: Exception) -> str:
+    """Build the user turn that asks the model to fix invalid JSON.
+
+    Args:
+        error: The parse failure that triggered the repair.
+
+    Returns:
+        The instruction text for the repair turn.
+    """
+    detail = " ".join(str(error).split())
+    if len(detail) > 300:
+        detail = detail[:300] + "..."
+    return (
+        f"Previous response was invalid: {detail}. "
+        "Reply with ONLY a single valid JSON object matching the schema."
+    )
+
+
 class VLMClient:
-    """Async facade over the vision-language model (Milestone 2)."""
+    """Async facade over the vision-language model (Milestone 2).
+
+    The transport is injectable so the decision flow can be tested
+    offline; the default transport performs a real HTTP POST.
+    """
+
+    def __init__(
+        self,
+        config: VLMConfig | None = None,
+        transport: Callable[[str, dict, dict, float], dict] | None = None,
+    ) -> None:
+        """Create a client.
+
+        Args:
+            config: Settings to use. When omitted, the configuration is
+                resolved from the environment on every call.
+            transport: Callable ``(url, headers, payload, timeout_s)``
+                returning the decoded response body. Defaults to a real
+                HTTP POST via :func:`_post_json`.
+        """
+        self._config = config
+        self._transport = transport
+
+    async def _call(
+        self,
+        transport: Callable[[str, dict, dict, float], dict],
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, object],
+        timeout_s: float,
+    ) -> str:
+        """Call *transport* off the event loop and return its content.
+
+        Args:
+            transport: The transport callable.
+            url: The endpoint URL.
+            headers: Request headers.
+            payload: The request body.
+            timeout_s: Request timeout in seconds.
+
+        Returns:
+            The assistant content from the response.
+
+        Raises:
+            VLMError: On a transport failure or a response without usable
+                content. The message never contains the key.
+        """
+        try:
+            response = await asyncio.to_thread(
+                transport, url, headers, payload, timeout_s
+            )
+        except VLMError:
+            raise
+        except Exception:
+            raise VLMError("request to the model endpoint failed") from None
+        return _extract_content(response)
 
     async def decide(
         self,
@@ -245,7 +397,8 @@ class VLMClient:
 
         Must return a schema-valid :class:`Decision` (validated against the
         action schema) and never arbitrary code — unparseable model output
-        is an error, not something to execute.
+        is repaired once and then reported as an ``uncertain`` decision,
+        never executed.
 
         Args:
             observation: The observation the decision is based on.
@@ -256,6 +409,72 @@ class VLMClient:
             The schema-valid decision for this observation.
 
         Raises:
-            NotImplementedError: Until Milestone 2.
+            VLMError: If the configuration or the screenshot is missing,
+                or if the endpoint cannot be reached or does not answer
+                with usable content.
         """
-        raise NotImplementedError("Milestone 2: VLMClient.decide")
+        config = self._config or load_vlm_config()
+        if not config.api_key:
+            raise VLMError("no API key configured (set NVIDIA_API_KEY)")
+        if not config.model:
+            raise VLMError("no model configured (set NVIDIA_MODEL)")
+
+        path = observation.screenshot_path
+        if not path:
+            raise VLMError("observation has no screenshot")
+        try:
+            present = Path(path).is_file()
+        except OSError:
+            present = False
+        if not present:
+            raise VLMError(f"screenshot file not found: {path}")
+        try:
+            image = encode_image_data_url(path)
+        except OSError:
+            raise VLMError(f"could not read screenshot file: {path}") from None
+
+        messages = build_messages(
+            image,
+            goal,
+            remaining_actions,
+            observation.viewport_width,
+            observation.viewport_height,
+        )
+        payload: dict = {
+            "model": config.model,
+            "messages": messages,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+        }
+        headers = {
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        base_url = config.base_url or VLMConfig.base_url
+        url = base_url.rstrip("/") + "/chat/completions"
+        transport = self._transport or _post_json
+
+        content = await self._call(
+            transport, url, headers, payload, config.timeout_s
+        )
+        try:
+            return parse_decision(content, observation.observation_id)
+        except (ValidationError, ValueError) as err:
+            first_error = err
+
+        repair_payload = {
+            **payload,
+            "messages": [
+                *messages,
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": _repair_instruction(first_error)},
+            ],
+        }
+        repaired = await self._call(
+            transport, url, headers, repair_payload, config.timeout_s
+        )
+        try:
+            return parse_decision(repaired, observation.observation_id)
+        except (ValidationError, ValueError) as err:
+            return fallback_decision(observation.observation_id, str(err))
