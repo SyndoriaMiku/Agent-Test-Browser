@@ -71,9 +71,9 @@ Configuration comes from `NVIDIA_*` variables, read by `load_vlm_config` (`src/g
 | `NVIDIA_BASE_URL` | no | OpenAI-compatible base URL; defaults to `https://integrate.api.nvidia.com/v1` |
 | `NVIDIA_TIMEOUT_S` / `NVIDIA_MAX_TOKENS` / `NVIDIA_TEMPERATURE` | no | Per-call limits, defaulting to 60 s / 512 tokens / 0.0 |
 
-- **`.env` is read.** `load_vlm_config` loads [`.env`](.env.example) via `python-dotenv` and merges
-  it *beneath* the process environment (shell variables win); `os.environ` is never mutated. Copy
-  `.env.example` to `.env` and fill in the key — and never commit `.env`.
+- **`.env` is read.** `load_vlm_config` loads `.env` (see `.env.example`) via `python-dotenv` and
+  merges it *beneath* the process environment (shell variables win); `os.environ` is never mutated.
+  Copy `.env.example` to `.env` and fill in the key **and** the model — and never commit `.env`.
 - **The live test is opt-in.** [tests/test_vlm_live.py](tests/test_vlm_live.py) drives the real
   browser to [examples/demo.html](examples/demo.html), screenshots it, and calls the real API
   (install Chromium first — see [Browser PoC](#browser-poc)):
@@ -82,7 +82,9 @@ Configuration comes from `NVIDIA_*` variables, read by `load_vlm_config` (`src/g
   .venv\Scripts\python -m pytest -m "live and browser" -v
   ```
 
-  It skips unless both `NVIDIA_API_KEY` and `NVIDIA_MODEL` are set in the environment.
+  It skips unless both `NVIDIA_API_KEY` and `NVIDIA_MODEL` resolve — the guard reads them through
+  `load_vlm_config`, exactly as the client does, so they may come from the process environment
+  **or** `.env`. As with the browser tests, a missing Chromium binary skips the test, never fails.
 - **The default suite stays offline.** The `live` marker is filtered out by the same `addopts` as
   the `browser` marker, so a plain `pytest` never touches the network or your API key.
 
