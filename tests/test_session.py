@@ -32,8 +32,11 @@ class FakeController:
         self.tmp, self.frames, self.i = tmp_path, list(frames), 0
         self.executed, self.release_calls, self.fail_execute = [], 0, set()
         self.fail_screenshot = False
+        self.fail_screenshot_on = set()   # 1-based screenshot call numbers that raise
+        self.screenshot_calls = 0
     async def screenshot(self):
-        if self.fail_screenshot:
+        self.screenshot_calls += 1
+        if self.fail_screenshot or self.screenshot_calls in self.fail_screenshot_on:
             raise ControllerError("screenshot failed")
         data = self.frames[min(self.i, len(self.frames) - 1)]
         self.i += 1
@@ -234,3 +237,61 @@ async def test_session_logs_observation_decision_action_and_verify(tmp_path, clo
     assert events[-2:] == ["observation", "decision"]     # the done decision runs no action
     assert all(row["observation_id"] for row in rows)
     assert rows[3]["changed"] is True
+
+async def test_low_confidence_decision_is_rejected_and_needs_user(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    vlm = FakeVLM([dec({"type": "click", "x": 10, "y": 10}, conf=0.1)])  # under the threshold
+    session = Session(ctrl, vlm, Settings(), clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert "rejected" in result.reason.lower()
+    assert "low_confidence" in result.reason
+    assert ctrl.executed == []                # a rejected decision never acts
+    assert ctrl.release_calls == 1
+
+async def test_out_of_bounds_decision_is_rejected_and_needs_user(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    vlm = FakeVLM([dec({"type": "click", "x": 5000, "y": 10})])  # outside the 1280x720 viewport
+    session = Session(ctrl, vlm, Settings(), clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert "rejected" in result.reason.lower()
+    assert "out_of_bounds" in result.reason
+    assert ctrl.executed == []
+    assert ctrl.release_calls == 1
+
+async def test_uncertain_decision_needs_user(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    vlm = FakeVLM([dec({"type": "uncertain", "reason": "screen unreadable"})])
+    session = Session(ctrl, vlm, Settings(), clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert "uncertain" in result.reason.lower()
+    assert ctrl.executed == []                # an uncertain decision never acts
+    assert ctrl.release_calls == 1
+
+async def test_verification_screenshot_error_counts_as_a_failure(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    ctrl.fail_screenshot_on = {2}            # observe (1) works, verify (2) raises
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=1, repeat_limit=99,
+                      clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER   # the recorded failure hit the cap
+    assert "verification failed" in result.reason.lower()
+    assert "failure cap reached" in result.reason.lower()
+    assert [a.type for a in ctrl.executed] == ["click"]
+    assert ctrl.release_calls == 1
+
+async def test_verification_screenshot_error_recovers_before_the_cap(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A", b"B"])
+    ctrl.fail_screenshot_on = {2, 4}         # both verification captures raise
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1}),
+                   dec({"type": "click", "x": 2, "y": 2})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=2, repeat_limit=99,
+                      clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER   # the second failure hits the cap
+    assert vlm.calls == 2                    # the first failure was recorded and recovered
+    assert len(ctrl.executed) == 2
+    assert ctrl.release_calls == 1
