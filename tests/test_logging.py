@@ -97,3 +97,15 @@ def test_default_clock_is_monotonic(tmp_path):
     log.close()
     row = _read(tmp_path / "s.jsonl")[0]
     assert isinstance(row["timestamp"], float)
+
+def test_log_verify_records_changed(tmp_path, clock):
+    obs = Observation(observation_id="obs-v", screenshot_path=None, viewport_width=1,
+                      viewport_height=1, device_scale_factor=1.0, timestamp=0.0)
+    log = SessionLogger(tmp_path / "v.jsonl", clock=clock)
+    log.log_verify(obs, changed=False, note="no visible change")
+    log.close()
+    row = _read(tmp_path / "v.jsonl")[0]
+    assert row["event"] == "verify"
+    assert row["observation_id"] == "obs-v"
+    assert row["changed"] is False
+    assert row["note"] == "no visible change"

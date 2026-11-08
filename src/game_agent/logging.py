@@ -67,6 +67,18 @@ class SessionLogger:
             record["reason"] = result.reason
         self._write(record)
 
+    def log_verify(self, observation: Observation, changed: bool, note: str = "") -> None:
+        """Record the post-action verification outcome for an observation."""
+        self._write(
+            {
+                "event": "verify",
+                "timestamp": self._clock.now(),
+                "observation_id": observation.observation_id,
+                "changed": changed,
+                "note": note,
+            }
+        )
+
     def close(self) -> None:
         """Flush and close the log file."""
         if not self._file.closed:
