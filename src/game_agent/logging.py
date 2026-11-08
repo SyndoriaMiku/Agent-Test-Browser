@@ -2,9 +2,10 @@
 
 Each record carries ``event``, ``timestamp``, and ``observation_id`` and
 contains only data derived from the ``Observation``/``Decision``/``Action``/
-``ValidationResult`` passed in -- never environment details, tokens, or auth
-headers. Time comes from an injected ``Clock`` (default ``MonotonicClock``)
-so logging stays deterministic in tests.
+``ValidationResult`` passed in, plus caller-supplied free text (the verify
+record's ``note``) -- never environment details, tokens, or auth headers.
+Time comes from an injected ``Clock`` (default ``MonotonicClock``) so
+logging stays deterministic in tests.
 """
 
 import json

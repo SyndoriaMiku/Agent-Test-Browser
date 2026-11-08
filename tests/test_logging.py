@@ -102,10 +102,20 @@ def test_log_verify_records_changed(tmp_path, clock):
     obs = Observation(observation_id="obs-v", screenshot_path=None, viewport_width=1,
                       viewport_height=1, device_scale_factor=1.0, timestamp=0.0)
     log = SessionLogger(tmp_path / "v.jsonl", clock=clock)
+    clock.advance(3.5)
     log.log_verify(obs, changed=False, note="no visible change")
     log.close()
-    row = _read(tmp_path / "v.jsonl")[0]
+    rows = _read(tmp_path / "v.jsonl")
+    assert len(rows) == 1
+    row = rows[0]
     assert row["event"] == "verify"
     assert row["observation_id"] == "obs-v"
     assert row["changed"] is False
     assert row["note"] == "no visible change"
+    assert row["timestamp"] == 3.5
+    log = SessionLogger(tmp_path / "v.jsonl", clock=clock)
+    log.log_verify(obs, changed=True)
+    log.close()
+    rows = _read(tmp_path / "v.jsonl")
+    assert len(rows) == 2
+    assert rows[1]["note"] == ""
