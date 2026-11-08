@@ -42,7 +42,7 @@ Input classes / failure modes most likely to bite, most likely first:
 
 **Interfaces:**
 - Consumes: Pillow.
-- Produces: `add_coordinate_grid(image_path, *, step: int = 100, scale: float = 1.0, out_path=None) -> str`.
+- Produces: `add_coordinate_grid(image_path, *, step: int = 100, scale: float = 1.0, out_path=None) -> str`; pure helpers `grid_lines(width: int, height: int, step: int, scale: float) -> tuple[list[int], list[int]]` (pixel positions of vertical/horizontal lines) and `format_label(pixel: int, scale: float) -> str` (CSS-px label) so the coordinate math is unit-testable without pixel inspection.
 
 - [ ] **Step 1: Install Pillow and add it to dependencies**
 
