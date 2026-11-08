@@ -124,6 +124,100 @@ async def test_image_changed_compares_bytes_and_treats_missing_as_changed(tmp_pa
     assert _image_changed(str(tmp_path / "gone.png"), str(second)) is True
     assert _image_changed(None, str(second)) is True
 
+async def test_unchanged_image_hits_failure_cap(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])          # same bytes every shot -> never changes
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=2,
+                      repeat_limit=99, clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=10)
+    assert result.state == State.NEEDS_USER
+    assert ctrl.release_calls == 1
+
+async def test_wait_action_is_exempt_from_unchanged_failure(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])          # never changes
+    vlm = FakeVLM([dec({"type": "wait", "duration_ms": 10}),
+                   dec({"type": "done", "summary": "ok"})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=1,
+                      repeat_limit=99, clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.DONE                 # wait does not false-fail
+
+async def test_repeated_action_hits_repeat_limit(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A", b"B"])    # changes each time, but same action repeats
+    vlm = FakeVLM([dec({"type": "click", "x": 5, "y": 5})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=99,
+                      repeat_limit=2, clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=10)
+    assert result.state == State.NEEDS_USER
+    assert "repeat" in result.reason.lower()
+
+async def test_budget_exhaustion_stops(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A", b"B", b"C", b"D"])
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(max_actions_per_session=2),
+                      max_consecutive_failures=99, repeat_limit=99, clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=10)
+    assert result.state == State.STOPPED
+    assert len(ctrl.executed) <= 2
+
+async def test_max_cycles_stops(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A", b"B", b"C"])
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=99, repeat_limit=99,
+                      clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=2)
+    assert result.state == State.STOPPED
+    assert result.cycles <= 2
+
+async def test_stop_ends_loop(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A", b"B", b"C"])
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=99, repeat_limit=99,
+                      clock=clock, sleep=make_sleep(clock))
+    session.stop()
+    result = await session.run("goal", max_cycles=10)
+    assert result.state == State.STOPPED
+    assert ctrl.release_calls == 1
+    assert ctrl.executed == []
+
+async def test_vlm_error_needs_user(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    vlm = FakeVLM([VLMError("no key")])
+    session = Session(ctrl, vlm, Settings(), clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert ctrl.release_calls == 1
+
+async def test_execute_error_recovers_or_caps(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    ctrl.fail_execute = {"click"}
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=1, repeat_limit=99,
+                      clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert ctrl.release_calls == 1
+
+async def test_execute_error_recovers_before_the_cap(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    ctrl.fail_execute = {"click"}
+    vlm = FakeVLM([dec({"type": "click", "x": 1, "y": 1})])
+    session = Session(ctrl, vlm, Settings(), max_consecutive_failures=2,
+                      repeat_limit=99, clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER         # second failure hits the cap
+    assert vlm.calls == 2                           # the first one recovered
+    assert ctrl.release_calls == 1
+
+async def test_screenshot_error_needs_user(tmp_path, clock):
+    ctrl = FakeController(tmp_path, [b"A"])
+    ctrl.fail_screenshot = True
+    vlm = FakeVLM([dec({"type": "done", "summary": "x"})])
+    session = Session(ctrl, vlm, Settings(), clock=clock, sleep=make_sleep(clock))
+    result = await session.run("goal", max_cycles=5)
+    assert result.state == State.NEEDS_USER
+    assert ctrl.release_calls == 1
+
 async def test_session_logs_observation_decision_action_and_verify(tmp_path, clock):
     import json
     from game_agent.logging import SessionLogger

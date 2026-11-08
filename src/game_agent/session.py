@@ -6,6 +6,13 @@ vision-language model.  Every cycle walks exactly the lifecycle the
 VALIDATING -> ACTING -> VERIFYING -> OBSERVING`` -- and every exit path
 runs ``controller.release_all()``, so no key or button is left held down.
 
+The loop is bounded by its safety limits: a failed action or an unchanged
+screen extends the failure streak (and routes through ``RECOVERING``), the
+same action ending on the same screen over and over is a repetition, the
+action budget and the cycle limit stop the session, and :meth:`Session.stop`
+ends it at the next cycle boundary.  Whenever the session cannot continue
+on its own it asks the user for help (``NEEDS_USER``).
+
 Time and sleeping are injected (``clock``/``sleep``) so the loop is
 deterministic in tests.  The minimum interval between two actions is waited
 out *before* the decision is validated: the validator would otherwise reject
@@ -14,6 +21,7 @@ the action as ``RATE_LIMITED`` because the last action was too recent.
 
 import asyncio
 import contextlib
+import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,6 +35,7 @@ from game_agent.schema import Action, Decision, DoneAction, UncertainAction
 from game_agent.session_state import Clock, MonotonicClock, SessionState
 from game_agent.state import State, StateMachine
 from game_agent.validation import ValidationResult, validate
+from game_agent.vlm import VLMError
 
 _PACE_MARGIN_S = 1e-6
 """Seconds slept on top of the remaining interval.
@@ -35,6 +44,15 @@ The validator rejects an action when less than ``min_action_interval_ms``
 passed since the previous one.  Floating-point rounding can leave the
 interval a fraction of a microsecond short, so the pace sleeps a hair
 longer and the wait is never borderline.
+"""
+
+_UNCHANGED_EXEMPT_ACTIONS = frozenset({"wait", "move", "release"})
+"""Actions that cannot change the screen.
+
+``wait``/``move``/``release`` leave the pixels untouched by design, so an
+unchanged screenshot after one of them is not a failure.  Every other
+executable action (``click``/``drag``/``wheel``/``press``/``hold``) is
+supposed to change the screen, and an unchanged one counts as a failure.
 """
 
 
@@ -79,6 +97,17 @@ def _screenshot_path(item: Observation | str | Path | None) -> str | None:
     return None if item is None else str(item)
 
 
+def _image_bytes(image: Observation | str | Path | None) -> bytes | None:
+    """Return the raw bytes of an image, or ``None`` when it cannot be read."""
+    path = _screenshot_path(image)
+    if path is None:
+        return None
+    try:
+        return Path(path).read_bytes()
+    except OSError:
+        return None
+
+
 def _image_changed(
     before: Observation | str | Path | None,
     after: Observation | str | Path | None,
@@ -90,14 +119,17 @@ def _image_changed(
     changed.  A missing screenshot counts as changed -- the session cannot
     prove otherwise, and calling it unchanged would hide a broken capture.
     """
-    before_path = _screenshot_path(before)
-    after_path = _screenshot_path(after)
-    if before_path is None or after_path is None:
+    before_bytes = _image_bytes(before)
+    after_bytes = _image_bytes(after)
+    if before_bytes is None or after_bytes is None:
         return True
-    try:
-        return Path(before_path).read_bytes() != Path(after_path).read_bytes()
-    except OSError:
-        return True
+    return before_bytes != after_bytes
+
+
+def _image_digest(image: Observation | str | Path | None) -> bytes:
+    """Return the SHA-256 digest of an image; empty when it cannot be read."""
+    data = _image_bytes(image)
+    return b"" if data is None else hashlib.sha256(data).digest()
 
 
 class Session:
@@ -152,14 +184,17 @@ class Session:
         self._machine = StateMachine()
         self._stopped = False
         self._last_decision: Decision | None = None
+        self._repeat_counts: dict[tuple[str, bytes], int] = {}
+        self._repeat_key: tuple[str, bytes] | None = None
 
     async def run(self, goal: str, max_cycles: int = 50) -> SessionResult:
         """Run the loop until the session ends.
 
         The loop ends when the model reports the goal done, when it cannot
-        act safely, when the cycle limit is reached, or when :meth:`stop` is
-        called.  Whatever ends it, ``controller.release_all()`` runs before
-        ``run`` returns.
+        act safely (the failure cap or the repeat limit is reached, or the
+        model fails), when the action budget or the cycle limit is
+        exhausted, or when :meth:`stop` is called.  Whatever ends it,
+        ``controller.release_all()`` runs before ``run`` returns.
 
         Args:
             goal: The player-facing goal the model is asked to achieve.
@@ -177,17 +212,37 @@ class Session:
                     reason = "stop requested"
                     break
 
+                if self._state.remaining_action_budget() <= 0:
+                    self._machine.transition(State.STOPPED)
+                    reason = "action budget exhausted"
+                    break
+
                 cycles += 1
                 self._machine.transition(State.OBSERVING)
                 await self._pace()
-                obs = await self._controller.screenshot()
-                vlm_obs = self._with_grid(obs)
+                try:
+                    obs = await self._controller.screenshot()
+                    vlm_obs = self._with_grid(obs)
+                except Exception as exc:
+                    # A broken capture or overlay cannot be recovered from:
+                    # the lifecycle has no way back from OBSERVING.  Every
+                    # controller/overlay error counts (a raw Playwright one
+                    # included); cancellation is a BaseException and is not
+                    # swallowed.
+                    reason = f"screenshot failed ({exc})"
+                    self._fail_observation()
+                    break
                 self._log_observation(obs)
 
                 self._machine.transition(State.DECIDING)
-                decision = await self._vlm.decide(
-                    vlm_obs, goal, self._state.remaining_action_budget()
-                )
+                try:
+                    decision = await self._vlm.decide(
+                        vlm_obs, goal, self._state.remaining_action_budget()
+                    )
+                except VLMError as exc:
+                    reason = f"model error ({exc})"
+                    self._machine.transition(State.NEEDS_USER)
+                    break
                 self._last_decision = decision
                 self._log_decision(obs, decision)
 
@@ -213,17 +268,10 @@ class Session:
                     reason = f"model is uncertain ({action.reason})"
                     break
 
-                self._machine.transition(State.ACTING)
-                await self._controller.execute(action)
-                self._state.record(action, self._clock.now())
-                self._log_action(obs, action, validation)
-
-                self._machine.transition(State.VERIFYING)
-                after = await self._controller.screenshot()
-                changed = _image_changed(obs.screenshot_path, after.screenshot_path)
-                self._log_verify(obs, changed)
-                if changed:
-                    self._state.record_success()
+                end = await self._act_and_verify(obs, action, validation)
+                if end is not None:
+                    reason = end
+                    break
             else:
                 # No branch broke out of the loop: the cycle limit ended it.
                 self._machine.transition(State.STOPPED)
@@ -241,6 +289,111 @@ class Session:
     def stop(self) -> None:
         """Ask the session to stop at the next cycle boundary."""
         self._stopped = True
+
+    async def _act_and_verify(
+        self, obs: Observation, action: Action, validation: ValidationResult
+    ) -> str | None:
+        """Execute *action*, check what it did, and apply the safety rules.
+
+        A controller failure (including a raw Playwright error) counts as a
+        failure of the session: the failure cap decides whether the loop
+        recovers or asks the user for help.  The screen comparison decides
+        whether the action worked: an unchanged screen after a
+        screen-affecting action is a failure, while ``wait``/``move``/
+        ``release`` cannot change the pixels and are exempt.  The same
+        action ending on the same screen over and over is a repetition and
+        needs the user as well.
+
+        Args:
+            obs: The observation the action was decided from.
+            action: The action to execute.
+            validation: The validation outcome, logged with the action.
+
+        Returns:
+            The reason to end the session with, or ``None`` when the loop
+            may continue with the next cycle.
+        """
+        self._machine.transition(State.ACTING)
+        try:
+            await self._controller.execute(action)
+        except Exception as exc:
+            if self._fail_action():
+                return f"action failed ({exc}) (failure cap reached)"
+            return None
+        self._state.record(action, self._clock.now())
+        self._log_action(obs, action, validation)
+
+        self._machine.transition(State.VERIFYING)
+        try:
+            after = await self._controller.screenshot()
+        except Exception as exc:
+            if self._fail_action():
+                return f"verification failed ({exc}) (failure cap reached)"
+            return None
+
+        changed = _image_changed(obs.screenshot_path, after.screenshot_path)
+        self._log_verify(obs, changed)
+        if changed:
+            self._state.record_success()
+            # Progress forgives earlier repetitions.
+            self._repeat_counts.clear()
+        elif action.type in _UNCHANGED_EXEMPT_ACTIONS:
+            self._state.record_success()
+        elif self._fail_action():
+            return f"screen unchanged after {action.type} (failure cap reached)"
+
+        repeats = self._record_repeat(action, after)
+        if repeats >= self._repeat_limit:
+            self._machine.transition(State.NEEDS_USER)
+            return f"repeated action {action.type} ({repeats} times)"
+        return None
+
+    def _fail_observation(self) -> None:
+        """Record a failure raised while observing; the session stops.
+
+        The lifecycle offers no way back from ``OBSERVING``, so a failed
+        capture ends the session in ``NEEDS_USER``.
+        """
+        self._state.record_failure()
+        self._machine.transition(State.NEEDS_USER)
+
+    def _fail_action(self) -> bool:
+        """Record a failure raised while acting or verifying.
+
+        The lifecycle moves through ``RECOVERING``; the failure cap turns
+        the failure into ``NEEDS_USER``.
+
+        Returns:
+            True when the session must stop.
+        """
+        self._state.record_failure()
+        self._machine.transition(State.RECOVERING)
+        if self._state.consecutive_failures >= self._max_consecutive_failures:
+            self._machine.transition(State.NEEDS_USER)
+            return True
+        return False
+
+    def _record_repeat(self, action: Action, after: Observation) -> int:
+        """Count how often the same action ended on the same screen in a row.
+
+        The key is the action and the SHA-256 digest of the screen it
+        produced.  A different key starts a new count, so only consecutive
+        repetitions are counted.
+
+        Args:
+            action: The action that was executed.
+            after: The observation captured after the action.
+
+        Returns:
+            How often this exact action/screen pair has occurred in a row.
+        """
+        key = (action.model_dump_json(), _image_digest(after))
+        if key != self._repeat_key:
+            self._repeat_counts.clear()
+            self._repeat_key = key
+        count = self._repeat_counts.get(key, 0) + 1
+        self._repeat_counts[key] = count
+        return count
 
     async def _pace(self) -> None:
         """Wait out the minimum interval since the last executed action."""
