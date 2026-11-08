@@ -138,6 +138,9 @@ button is ever left held down.
 A model error or an `uncertain` decision also ends the run in `NEEDS_USER` — the loop never spins
 forever and never leaves input stuck down.
 
+A run may end in `STOPPED` at the cycle limit when the model never signals `done`: M3 guarantees
+that the loop terminates, not that it solves the task — detecting goal progress is future work.
+
 ### The `pillow` dependency
 
 The grid overlay is the only part of the agent that draws images, so M3 added exactly one dependency:
@@ -152,9 +155,10 @@ The grid overlay is the only part of the agent that draws images, so M3 added ex
 [tests/test_session_live.py](tests/test_session_live.py) drives the **whole** loop against a real
 headless Chromium and the real model API: it opens [examples/demo.html](examples/demo.html), lets the
 session observe, decide, validate, act and verify, and then checks that the session ended in a
-terminal state (`DONE` or `NEEDS_USER`) after at least one cycle. It is opt-in like the other live
-tests, and it **skips** — never fails — when the credentials or the Chromium build are missing, so a
-fresh checkout is never red:
+terminal state (`DONE`, `NEEDS_USER` or `STOPPED`) after between one and the requested six cycles.
+It asserts that the loop ran end-to-end and terminated — M3 does not promise task success. It is
+opt-in like the other live tests, and it **skips** — never fails — when the credentials or the
+Chromium build are missing, so a fresh checkout is never red:
 
 ```powershell
 .venv\Scripts\python -m pytest -m "live and browser" tests/test_session_live.py -v
@@ -166,8 +170,8 @@ Playwright Chromium build (see [Browser PoC](#browser-poc)).
 - **A note on the demo page.** [examples/demo.html](examples/demo.html) keeps its `Start` button on
   screen after a click — only the `clicks=N` counter changes. A model that keeps re-clicking it never
   reaches the "press the up arrow" half of the goal, so the run ends at the cycle limit (`STOPPED`)
-  rather than in `DONE`/`NEEDS_USER`. The loop still terminates and still releases its input; the
-  assertion just does not accept that third terminal state.
+  rather than in `DONE`/`NEEDS_USER`. The loop still terminates and still releases its input, and the
+  live test accepts that third terminal state — it asserts termination, not task success.
 
 ## Configuration
 
