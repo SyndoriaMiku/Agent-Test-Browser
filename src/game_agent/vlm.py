@@ -80,6 +80,9 @@ def load_vlm_config(env: Mapping[str, str] | None = None) -> VLMConfig:
 _DECISION_SCHEMA_JSON: str = json.dumps(Decision.model_json_schema(), indent=2)
 """Exact JSON schema of :class:`Decision`, rendered once for the prompt."""
 
+_USAGE_FIELDS: tuple[str, ...] = ("prompt_tokens", "completion_tokens", "total_tokens")
+"""Token counters summed from the ``usage`` block of a model response."""
+
 _SYSTEM_PROMPT = f"""\
 You are the decision-making brain of a browser game agent. You see one
 screenshot of the current viewport and must choose the next action.
@@ -334,6 +337,10 @@ class VLMClient:
 
     The transport is injectable so the decision flow can be tested
     offline; the default transport performs a real HTTP POST.
+
+    After every :meth:`decide` the client reports the model it used in
+    :attr:`model` and the tokens the endpoint charged in :attr:`last_usage`
+    (the sum over the first call and the possible repair call).
     """
 
     def __init__(
@@ -352,6 +359,37 @@ class VLMClient:
         """
         self._config = config
         self._transport = transport
+        self.model: str | None = None
+        self.last_usage: dict | None = None
+
+    def _record_usage(self, response: object) -> None:
+        """Add the token counters of *response* to :attr:`last_usage`.
+
+        The endpoint may omit the ``usage`` block or report only some of
+        the counters; missing and non-numeric values are ignored.  The
+        counters of every response of one decision are summed, so the
+        repair call is never undercounted.
+
+        Args:
+            response: The decoded response body.
+        """
+        if not isinstance(response, Mapping):
+            return
+        usage = response.get("usage")
+        if not isinstance(usage, Mapping):
+            return
+        total = self.last_usage
+        if total is None:
+            total = {field: 0 for field in _USAGE_FIELDS}
+        counted = False
+        for field in _USAGE_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            total[field] = total.get(field, 0) + value
+            counted = True
+        if counted:
+            self.last_usage = total
 
     async def _call(
         self,
@@ -385,6 +423,7 @@ class VLMClient:
             raise
         except Exception:
             raise VLMError("request to the model endpoint failed") from None
+        self._record_usage(response)
         return _extract_content(response)
 
     async def decide(
@@ -413,7 +452,9 @@ class VLMClient:
                 or if the endpoint cannot be reached or does not answer
                 with usable content.
         """
+        self.last_usage = None
         config = self._config or load_vlm_config()
+        self.model = config.model
         if not config.api_key:
             raise VLMError("no API key configured (set NVIDIA_API_KEY)")
         if not config.model:

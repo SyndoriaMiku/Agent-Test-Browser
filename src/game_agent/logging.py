@@ -3,7 +3,8 @@
 Each record carries ``event``, ``timestamp``, and ``observation_id`` and
 contains only data derived from the ``Observation``/``Decision``/``Action``/
 ``ValidationResult`` passed in, plus caller-supplied free text (the verify
-record's ``note``) -- never environment details, tokens, or auth headers.
+record's ``note``) and the model name and token counts of the model record
+-- never environment details, credentials, or auth headers.
 Time comes from an injected ``Clock`` (default ``MonotonicClock``) so
 logging stays deterministic in tests.
 """
@@ -67,6 +68,33 @@ class SessionLogger:
             record["accepted"] = result.accepted
             record["reason"] = result.reason
         self._write(record)
+
+    def log_model(
+        self,
+        observation: Observation,
+        model: str,
+        usage: dict | None,
+    ) -> None:
+        """Record the model used for an observation and its token usage.
+
+        Args:
+            observation: The observation the decision is based on.
+            model: The name of the model that produced the decision.
+            usage: The token counters charged by the model; missing
+                counters are recorded as zero.
+        """
+        counts = usage or {}
+        self._write(
+            {
+                "event": "model",
+                "timestamp": self._clock.now(),
+                "observation_id": observation.observation_id,
+                "model": model,
+                "prompt_tokens": counts.get("prompt_tokens", 0),
+                "completion_tokens": counts.get("completion_tokens", 0),
+                "total_tokens": counts.get("total_tokens", 0),
+            }
+        )
 
     def log_verify(self, observation: Observation, changed: bool, note: str = "") -> None:
         """Record the post-action verification outcome for an observation."""

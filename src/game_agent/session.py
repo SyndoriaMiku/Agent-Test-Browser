@@ -245,6 +245,7 @@ class Session:
                     break
                 self._last_decision = decision
                 self._log_decision(obs, decision)
+                self._log_model(obs)
 
                 self._machine.transition(State.VALIDATING)
                 validation = validate(
@@ -434,6 +435,19 @@ class Session:
         """Record the decision made for *obs*."""
         if self._logger is not None:
             self._logger.log_decision(obs, decision)
+
+    def _log_model(self, obs: Observation) -> None:
+        """Record the model and its token usage when the model reports any.
+
+        Both the model and its usage are read defensively: a vision model
+        that does not report them simply produces no model record.
+        """
+        usage = getattr(self._vlm, "last_usage", None)
+        if not usage:
+            return
+        log_model = getattr(self._logger, "log_model", None)
+        if callable(log_model):
+            log_model(obs, getattr(self._vlm, "model", None) or "", usage)
 
     def _log_action(
         self, obs: Observation, action: Action, result: ValidationResult

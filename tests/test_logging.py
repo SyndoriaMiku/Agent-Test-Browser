@@ -98,6 +98,35 @@ def test_default_clock_is_monotonic(tmp_path):
     row = _read(tmp_path / "s.jsonl")[0]
     assert isinstance(row["timestamp"], float)
 
+def test_log_model_records_tokens(tmp_path, clock):
+    from game_agent.logging import SessionLogger
+    from game_agent.observation import Observation
+    obs = Observation("obs-m", None, 1, 1, 1.0, 0.0)
+    log = SessionLogger(tmp_path / "m.jsonl", clock=clock)
+    log.log_model(obs, "some-model", {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12})
+    log.close()
+    import json
+    row = json.loads((tmp_path / "m.jsonl").read_text(encoding="utf-8").strip())
+    assert row["event"] == "model" and row["observation_id"] == "obs-m"
+    assert row["model"] == "some-model" and row["prompt_tokens"] == 5 and row["completion_tokens"] == 7
+
+def test_log_model_without_usage_records_zero_tokens(tmp_path, clock):
+    log = SessionLogger(tmp_path / "m.jsonl", clock=clock)
+    log.log_model(OBS, "some-model", None)
+    log.close()
+    row = _read(tmp_path / "m.jsonl")[0]
+    assert row["event"] == "model"
+    assert row["prompt_tokens"] == 0 and row["completion_tokens"] == 0
+    assert row["total_tokens"] == 0
+
+def test_log_model_records_the_timestamp_of_the_injected_clock(tmp_path, clock):
+    log = SessionLogger(tmp_path / "m.jsonl", clock=clock)
+    clock.advance(1.5)
+    log.log_model(OBS, "some-model", {"prompt_tokens": 1, "completion_tokens": 1,
+                                      "total_tokens": 2})
+    log.close()
+    assert _read(tmp_path / "m.jsonl")[0]["timestamp"] == 1.5
+
 def test_log_verify_records_changed(tmp_path, clock):
     obs = Observation(observation_id="obs-v", screenshot_path=None, viewport_width=1,
                       viewport_height=1, device_scale_factor=1.0, timestamp=0.0)
