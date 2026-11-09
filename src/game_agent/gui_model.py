@@ -7,8 +7,8 @@ records written by the session logger plus the runner's own ``status``/
 ``session_end``/``error`` records) into compact human-readable strings,
 :func:`preview_path` picks the screenshot the preview pane should show,
 and :class:`UsageTracker` accumulates the model's token usage and prices
-it.  The only I/O in the module is the file-existence check inside
-:func:`preview_path`.
+it (costs are USD; prices are per 1,000,000 tokens).  The only I/O in
+the module is the file-existence check inside :func:`preview_path`.
 
 Rendering is defensive by design: every field is read with ``.get`` and
 unknown or malformed records fall back to a generic string instead of
@@ -80,7 +80,7 @@ def _format_action_record(event: dict) -> str:
     line = (
         f"action {event.get('observation_id')}  {_format_action(event.get('action'))}"
     )
-    if "accepted" in event:
+    if event.get("accepted") is not None:
         if event["accepted"]:
             line += "  accepted (validation)"
         else:
@@ -106,9 +106,9 @@ def _format_model(event: dict) -> str:
     """``model`` record: model name and the tokens it charged."""
     return (
         f"model {event.get('observation_id')}  {event.get('model') or '?'}  tokens:"
-        f" {event.get('prompt_tokens', 0)} in /"
-        f" {event.get('completion_tokens', 0)} out /"
-        f" {event.get('total_tokens', 0)} total"
+        f" {event.get('prompt_tokens') or 0} in /"
+        f" {event.get('completion_tokens') or 0} out /"
+        f" {event.get('total_tokens') or 0} total"
     )
 
 
@@ -153,7 +153,12 @@ def _format_action(action: object) -> str:
         return "(no action)" if action is None else str(action)
     kind = action.get("type")
     if kind == "click":
-        return f"click @ ({action.get('x')}, {action.get('y')})"
+        line = f"click @ ({action.get('x')}, {action.get('y')})"
+        if action.get("button"):
+            line += f" {action['button']}"
+        if action.get("click_count"):
+            line += f" x{action['click_count']}"
+        return line
     if kind == "move":
         return f"move @ ({action.get('x')}, {action.get('y')})"
     if kind == "press":
@@ -249,15 +254,14 @@ class UsageTracker:
     ) -> float | None:
         """Return the accumulated cost in USD, or ``None`` without both prices.
 
-        ``in_per_1m`` / ``out_per_1m`` price one million prompt /
-        completion tokens, expressed in thousandths of a dollar (the M5
-        plan's example prices ``1_000_000`` / ``2_000_000`` therefore mean
-        1 USD / 2 USD per thousand tokens).  The cost normalizes the token
-        totals to millions and the prices back to dollars:
-        ``prompt / 1e6 * in / 1e3 + completion / 1e6 * out / 1e3``.
+        ``in_per_1m`` / ``out_per_1m`` are prices in **USD per 1,000,000
+        tokens** for prompt / completion tokens respectively (so ``1.0``
+        means one dollar per million prompt tokens).  The cost normalizes
+        the token totals to millions and applies the prices directly:
+        ``prompt / 1e6 * in_per_1m + completion / 1e6 * out_per_1m``.
         """
         if in_per_1m is None or out_per_1m is None:
             return None
-        prompt_cost = self._prompt_tokens / _MILLION * in_per_1m / 1_000
-        completion_cost = self._completion_tokens / _MILLION * out_per_1m / 1_000
+        prompt_cost = self._prompt_tokens / _MILLION * in_per_1m
+        completion_cost = self._completion_tokens / _MILLION * out_per_1m
         return prompt_cost + completion_cost

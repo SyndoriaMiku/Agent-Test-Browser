@@ -33,7 +33,8 @@ def test_usage_tracker_sums_and_costs():
     t.add({"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
     t.add({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
     assert (t.prompt_tokens, t.completion_tokens, t.total_tokens) == (110, 55, 165)
-    assert t.cost_usd(1_000_000, 2_000_000) == pytest.approx(0.110 + 0.110)
+    # Prices are USD per 1,000,000 tokens: 110 prompt @ $1/1M + 55 completion @ $2/1M.
+    assert t.cost_usd(1.0, 2.0) == pytest.approx(110 / 1e6 * 1.0 + 55 / 1e6 * 2.0)
     assert t.cost_usd(None, None) is None
 
 
@@ -58,6 +59,12 @@ def test_format_action_rejected_shows_reason():
                       "accepted": False, "reason": "rate_limited"})
     assert "rejected" in s and "rate_limited" in s
 
+def test_format_action_null_accepted_is_no_verdict():
+    s = format_event({"event": "action", "observation_id": "obs-1",
+                      "action": {"type": "wait", "duration_ms": 10},
+                      "accepted": None})
+    assert "accepted" not in s and "rejected" not in s
+
 def test_format_action_without_validation_outcome():
     s = format_event({"event": "action", "observation_id": "obs-1",
                       "action": {"type": "press", "key": "Enter"}})
@@ -77,6 +84,12 @@ def test_format_model_shows_name_and_tokens():
                       "model": "some-model",
                       "prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12})
     assert "some-model" in s and "5" in s and "7" in s and "12" in s
+
+def test_format_model_null_tokens_read_as_zero():
+    s = format_event({"event": "model", "observation_id": "obs-1",
+                      "model": None, "prompt_tokens": None,
+                      "completion_tokens": None, "total_tokens": None})
+    assert "0 in / 0 out / 0 total" in s
 
 def test_format_runner_events():
     assert "running" in format_event({"event": "status", "status": "running"})
@@ -102,6 +115,10 @@ def test_format_event_handles_a_real_jsonl_record():
 
 @pytest.mark.parametrize("action,needle", [
     ({"type": "click", "x": 1, "y": 2}, "click @ (1, 2)"),
+    ({"type": "click", "x": 1, "y": 2, "button": "right"}, "click @ (1, 2) right"),
+    ({"type": "click", "x": 1, "y": 2, "click_count": 2}, "click @ (1, 2) x2"),
+    ({"type": "click", "x": 1, "y": 2, "button": "middle", "click_count": 3},
+     "click @ (1, 2) middle x3"),
     ({"type": "move", "x": 4, "y": 5}, "move @ (4, 5)"),
     ({"type": "press", "key": "Enter"}, "Enter"),
     ({"type": "hold", "key": "a", "duration_ms": 200}, "200ms"),
@@ -146,4 +163,5 @@ def test_usage_tracker_cost_needs_both_prices():
     t.add({"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000})
     assert t.cost_usd(None, 2.0) is None
     assert t.cost_usd(1.0, None) is None
-    assert t.cost_usd(1.0, 2.0) == pytest.approx(0.001 + 0.002)
+    # 1M prompt tokens @ $1/1M + 1M completion tokens @ $2/1M = $3.00.
+    assert t.cost_usd(1.0, 2.0) == pytest.approx(3.0)
