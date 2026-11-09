@@ -34,6 +34,13 @@ class FakeController:
         self.fail_screenshot = False
         self.fail_screenshot_on = set()   # 1-based screenshot call numbers that raise
         self.screenshot_calls = 0
+        self.opened, self.closed, self.url = False, False, None
+    async def open(self):
+        self.opened = True
+    async def goto(self, url):
+        self.url = url
+    async def close(self):
+        self.closed = True
     async def screenshot(self):
         self.screenshot_calls += 1
         if self.fail_screenshot or self.screenshot_calls in self.fail_screenshot_on:
