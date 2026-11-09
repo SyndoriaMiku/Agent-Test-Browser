@@ -244,7 +244,8 @@ def test_usage_tracker_sums_and_costs():
     t.add({"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
     t.add({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
     assert (t.prompt_tokens, t.completion_tokens, t.total_tokens) == (110, 55, 165)
-    assert t.cost_usd(1_000_000, 2_000_000) == pytest.approx(0.110 + 0.110)
+    # prices are USD per 1,000,000 tokens
+    assert t.cost_usd(1.0, 2.0) == pytest.approx(110 / 1e6 * 1.0 + 55 / 1e6 * 2.0)
     assert t.cost_usd(None, None) is None
 ```
 
@@ -377,7 +378,7 @@ A Tk app:
 - Bottom: status label (state / cycles / remaining / tokens / cost).
 - `Start`: create a `queue.Queue`, a `GuiRunner`, call `runner.start(url, goal, settings, viewport, grid_step=100)`.
 - `after(150, self._poll)`: drain the queue → append `format_event(e)` to the log; on `observation` → load `preview_path(...)` via Pillow → `ImageTk.PhotoImage` (scaled, keep aspect) and set the label; on `model` → update `UsageTracker` + status; on `status`/`session_end`/`error` → update status/log.
-- `Stop`: `runner.stop()`; window close (`WM_DELETE_WINDOW`) → `runner.stop()` + destroy.
+- `Stop`: `runner.stop()`. `Start`: first call `self._runner.shutdown()` if a previous runner exists (idempotent: stop+join+ensure browser closed), then create a new runner and `start(...)`. Window close (`WM_DELETE_WINDOW`) → `runner.shutdown()` then destroy.
 - `if __name__ == "__main__": main()`.
 - Never display the API key.
 
