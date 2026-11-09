@@ -12,7 +12,14 @@ Browser lifecycle: the runner opens the browser before the session starts
 and leaves it **open** when the run ends, so the user can look at the final
 screen.  A stop request closes it instead -- the session stops at its next
 cycle boundary (an action or a model call in flight is never interrupted)
-and the browser is closed once ``run`` has returned.
+and the browser is closed once ``run`` has returned.  :meth:`GuiRunner.shutdown`
+does the same for a run that already ended: it stops the run, joins the
+worker and closes the browser, so the view can close the browser of the
+previous run before it starts a new one.
+
+Whatever happens, the runner ends up closed: the close is attempted exactly
+once and is marked as done even when there was no browser to close, so
+:meth:`GuiRunner.join` always returns.
 
 The worker keeps its event loop alive after the session ended: Playwright's
 transport task lives on that loop, so closing it would leave the browser
@@ -111,7 +118,8 @@ class GuiRunner:
             (``clock``, ``sleep``, the safety limits, ...) plus the
             optional ``logger_out`` path of the JSONL session log.
 
-    A runner drives a single run: :meth:`start` may be called once.
+    A runner drives a single run: :meth:`start` may be called once.  The
+    view calls :meth:`shutdown` to close the browser of a finished run.
     """
 
     def __init__(
@@ -139,8 +147,11 @@ class GuiRunner:
         self._stop_requested = False
         self._started = False
         self._browser_closed = False
+        self._close_started = False
+        self._loop_closed = False
         self._close_lock = threading.Lock()
         self._closed = threading.Event()
+        self._worker_done = threading.Event()
 
     # --- control -------------------------------------------------------------
 
@@ -171,6 +182,7 @@ class GuiRunner:
             raise RuntimeError("this runner was already started")
         self._started = True
         self._stop_requested = False
+        self._closed.clear()
         self._thread = threading.Thread(
             target=self._worker,
             args=(url, goal, settings, viewport, grid_step),
@@ -214,11 +226,16 @@ class GuiRunner:
         session = self._session
         if session is not None:
             session.stop()
-        if not self.is_running:
+        if self._thread is None or self._worker_done.is_set():
+            # The worker is gone (or never ran): nobody else closes the
+            # browser, so the close starts here.
             self._close_browser_later()
 
     def join(self, timeout: float | None = None) -> None:
         """Wait for the run to finish.
+
+        After a stop the browser is closed as well, and the wait covers
+        that close: a returned ``join`` means the browser is gone.
 
         Args:
             timeout: How long to wait, in seconds; ``None`` waits forever.
@@ -229,12 +246,34 @@ class GuiRunner:
         deadline = None if timeout is None else time.monotonic() + timeout
         thread.join(timeout)
         if self._stop_requested:
-            # A stop that arrived after the run ended closes the browser on
-            # its own thread; wait for that close as well.
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            self._closed.wait(remaining)
+            # A stop closes the browser; wait for that close as well.
+            self._closed.wait(self._remaining(deadline))
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Stop the run, join the worker and close the browser.
+
+        The call is idempotent: a runner that is already closed stays
+        closed, and the browser is closed exactly once.  The view calls it
+        before a new Start -- to close the browser of the previous run --
+        and when the window closes.
+
+        Args:
+            timeout: How long to wait for the worker and for the close, in
+                seconds; ``None`` waits forever.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        self.stop()
+        self.join(self._remaining(deadline))
+        # A run that ended normally leaves its browser open: close it now.
+        self._close_browser_later()
+        self._closed.wait(self._remaining(deadline))
+
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        """Return the seconds left until *deadline*."""
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
 
     @property
     def is_running(self) -> bool:
@@ -260,17 +299,28 @@ class GuiRunner:
         open but could not be driven or closed any more.  The loop is
         closed together with the browser instead.
         """
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
+        loop: asyncio.AbstractEventLoop | None = None
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
             loop.run_until_complete(
                 self._run(url, goal, settings, viewport, grid_step)
             )
         finally:
-            if self._closed.is_set():
-                # The browser is gone; nothing needs the loop any more.
-                self._close_loop(loop)
+            # The run is over: from here on nobody else closes the
+            # browser, so a stop that arrives now is handed over to the
+            # late close.
+            self._worker_done.set()
+            if loop is not None:
+                if self._stop_requested:
+                    # A stop that landed while the run was tearing down
+                    # still closes the browser.
+                    with contextlib.suppress(Exception):
+                        loop.run_until_complete(self._close_browser())
+                if self._closed.is_set():
+                    # The browser is gone; nothing needs the loop any more.
+                    self._close_loop_once(loop)
 
     async def _run(
         self,
@@ -319,6 +369,10 @@ class GuiRunner:
                     "reason": result.reason,
                 }
             )
+            if not self._stop_requested:
+                # The run ended on its own; the browser stays open for the
+                # user to look at.
+                self._queue.put({"event": "status", "status": "finished"})
         except Exception as exc:
             self._queue.put({"event": "error", "message": str(exc)})
         finally:
@@ -331,18 +385,26 @@ class GuiRunner:
     # --- the browser ---------------------------------------------------------
 
     async def _close_browser(self) -> None:
-        """Release the held inputs and close the browser, exactly once."""
+        """Release the held inputs and close the browser, exactly once.
+
+        The runner is marked as closed even when there is no browser to
+        close -- a browser that never opened leaves nothing to wait for --
+        so a waiting :meth:`join` is always released.
+        """
         with self._close_lock:
             if self._browser_closed:
                 return
             self._browser_closed = True
         controller = self._controller
-        if controller is not None:
-            with contextlib.suppress(Exception):
-                await controller.release_all()
-            with contextlib.suppress(Exception):
-                await controller.close()
-        self._closed.set()
+        try:
+            if controller is not None:
+                with contextlib.suppress(Exception):
+                    await controller.release_all()
+                with contextlib.suppress(Exception):
+                    await controller.close()
+        finally:
+            self._closed.set()
+            self._queue.put({"event": "status", "status": "stopped"})
 
     def _close_browser_later(self) -> None:
         """Close the browser of a finished run on the runner's own loop.
@@ -351,9 +413,27 @@ class GuiRunner:
         close runs there as well -- a browser that was left open by a
         finished run has to be closed from that loop to stay controllable.
         """
-        loop = self._loop
-        if loop is None or self._controller is None or self._browser_closed:
+        if self._thread is None:
+            # The runner never ran: there is no browser to close.
+            self._closed.set()
             return
+        if not self._worker_done.is_set():
+            # The worker still owns the loop; it closes the browser itself.
+            return
+        loop = self._loop
+        if loop is None:
+            # The worker died before it could open a browser.
+            self._closed.set()
+            return
+        with self._close_lock:
+            if self._browser_closed:
+                # The close is done or on its way; it marks the runner as
+                # closed when it finishes.
+                return
+            if self._close_started:
+                # A close is already on its way.
+                return
+            self._close_started = True
         threading.Thread(
             target=self._close_on_loop,
             args=(loop,),
@@ -363,17 +443,32 @@ class GuiRunner:
 
     def _close_on_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Close the browser on *loop* and close the loop with it."""
+        worker = self._thread
+        if worker is not None and worker is not threading.current_thread():
+            # The worker owns the loop until it returns.
+            worker.join()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._close_browser())
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(self._close_browser())
         finally:
-            self._close_loop(loop)
+            self._close_loop_once(loop)
+            if not self._closed.is_set():
+                # The close could not run at all: there is nothing left to
+                # wait for, so the runner counts as closed.
+                self._closed.set()
 
-    @staticmethod
-    def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
-        """Close an event loop, ignoring what a busy loop complains about."""
-        with contextlib.suppress(Exception):
-            loop.close()
+    def _close_loop_once(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Close *loop* once; a loop that is still in use is left open."""
+        with self._close_lock:
+            if self._loop_closed:
+                return
+            try:
+                loop.close()
+            except Exception:
+                # The loop is still running: whoever owns it closes it.
+                return
+            self._loop_closed = True
 
 
 # --- defaults and helpers ----------------------------------------------------
