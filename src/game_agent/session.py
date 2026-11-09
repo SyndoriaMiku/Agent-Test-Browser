@@ -13,6 +13,12 @@ action budget and the cycle limit stop the session, and :meth:`Session.stop`
 ends it at the next cycle boundary.  Whenever the session cannot continue
 on its own it asks the user for help (``NEEDS_USER``).
 
+The session can be held at a cycle boundary with :meth:`Session.pause` and
+released again with :meth:`Session.resume`; :meth:`Session.stop` always wins
+over a pause.  The read-only properties :attr:`Session.state`,
+:attr:`Session.cycles` and :attr:`Session.remaining_actions` expose the
+session's progress without reaching into its internals.
+
 Time and sleeping are injected (``clock``/``sleep``) so the loop is
 deterministic in tests.  The minimum interval between two actions is waited
 out *before* the decision is validated: the validator would otherwise reject
@@ -183,6 +189,8 @@ class Session:
         self._state = SessionState(settings, clock=self._clock)
         self._machine = StateMachine()
         self._stopped = False
+        self._paused = False
+        self._cycles = 0
         self._last_decision: Decision | None = None
         self._repeat_counts: dict[tuple[str, bytes], int] = {}
         self._repeat_key: tuple[str, bytes] | None = None
@@ -193,8 +201,9 @@ class Session:
         The loop ends when the model reports the goal done, when it cannot
         act safely (the failure cap or the repeat limit is reached, or the
         model fails), when the action budget or the cycle limit is
-        exhausted, or when :meth:`stop` is called.  Whatever ends it,
-        ``controller.release_all()`` runs before ``run`` returns.
+        exhausted, or when :meth:`stop` is called.  A paused session waits
+        at the cycle boundary until it is resumed or stopped.  Whatever
+        ends it, ``controller.release_all()`` runs before ``run`` returns.
 
         Args:
             goal: The player-facing goal the model is asked to achieve.
@@ -203,10 +212,19 @@ class Session:
         Returns:
             The :class:`SessionResult` describing how the session ended.
         """
-        cycles = 0
         reason = ""
+        # The counter lives on the instance so it can be read while the
+        # loop runs; it is reset here so a run always counts its own
+        # cycles, exactly as the previous local counter did.
+        self._cycles = 0
         try:
-            while cycles < max_cycles:
+            while self._cycles < max_cycles:
+                # The pause gate sits at the very top of the cycle, before
+                # the stop check: a stop request always wins over a pause,
+                # so a stopped session never waits for a resume.
+                while self._paused and not self._stopped:
+                    await self._sleep(0.1)
+
                 if self._stopped:
                     self._machine.transition(State.STOPPED)
                     reason = "stop requested"
@@ -217,7 +235,7 @@ class Session:
                     reason = "action budget exhausted"
                     break
 
-                cycles += 1
+                self._cycles += 1
                 self._machine.transition(State.OBSERVING)
                 await self._pace()
                 try:
@@ -282,10 +300,38 @@ class Session:
 
         return SessionResult(
             state=self._machine.state,
-            cycles=cycles,
+            cycles=self._cycles,
             reason=reason,
             last_decision=self._last_decision,
         )
+
+    @property
+    def state(self) -> State:
+        """The lifecycle state the session is in."""
+        return self._machine.state
+
+    @property
+    def cycles(self) -> int:
+        """How many cycles the session has run."""
+        return self._cycles
+
+    @property
+    def remaining_actions(self) -> int:
+        """How many actions are left before the session budget runs out."""
+        return self._state.remaining_action_budget()
+
+    def pause(self) -> None:
+        """Ask the session to wait at the next cycle boundary.
+
+        The session keeps its place: it wakes up and continues where it
+        left off once :meth:`resume` is called.  A stop request always
+        wins over a pause.
+        """
+        self._paused = True
+
+    def resume(self) -> None:
+        """Let a paused session continue at the next cycle boundary."""
+        self._paused = False
 
     def stop(self) -> None:
         """Ask the session to stop at the next cycle boundary."""
@@ -318,6 +364,13 @@ class Session:
         try:
             await self._controller.execute(action)
         except Exception as exc:
+            # The attempt belongs in the log even when it failed: the log
+            # records what the agent tried, not only what worked.  The
+            # validation had already accepted the action, so the record
+            # shows it as accepted.  Logging is best-effort here -- a
+            # broken log must not mask the controller failure.
+            with contextlib.suppress(Exception):
+                self._log_action(obs, action, validation)
             if self._fail_action():
                 return f"action failed ({exc}) (failure cap reached)"
             return None
