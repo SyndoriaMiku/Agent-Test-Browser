@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import scrolledtext, ttk
@@ -77,6 +78,7 @@ class GameAgentGui(tk.Tk):
         self._input_price, self._output_price = _read_prices()
         self._runner_status = "idle"
         self._state_name = "IDLE"
+        self._terminal_status: str | None = None
         self._cycles = 0
         self._remaining: int | None = None
         self._preview_photo: ImageTk.PhotoImage | None = None
@@ -185,11 +187,12 @@ class GameAgentGui(tk.Tk):
         if self._runner is not None:
             self._status_var.set("State: STOPPING")
             self.update_idletasks()
-            try:
-                self._runner.shutdown()
-            except Exception as exc:
-                self._report_error(f"Could not stop the previous run: {exc}")
-                return
+            previous = self._runner
+            threading.Thread(
+                target=previous.shutdown,
+                name="game-agent-gui-previous-shutdown",
+                daemon=True,
+            ).start()
 
         try:
             settings: Settings = load_settings()
@@ -201,6 +204,7 @@ class GameAgentGui(tk.Tk):
         self._usage = UsageTracker()
         self._runner_status = "starting"
         self._state_name = "IDLE"
+        self._terminal_status = None
         self._cycles = 0
         self._remaining = None
         self._preview_photo = None
@@ -285,6 +289,8 @@ class GameAgentGui(tk.Tk):
                 self._runner_status = status
                 if status not in {"running", "paused"}:
                     self._state_name = status.upper()
+                if status == "stopped":
+                    self._terminal_status = "STOPPED"
         elif kind == "session_end":
             state = event.get("state")
             if isinstance(state, str):
@@ -293,9 +299,11 @@ class GameAgentGui(tk.Tk):
             if isinstance(cycles, int):
                 self._cycles = cycles
             self._runner_status = "finished"
+            self._terminal_status = "FINISHED"
         elif kind == "error":
             self._runner_status = "error"
             self._state_name = "ERROR"
+            self._terminal_status = "ERROR"
 
     def _show_preview(self, path: str) -> None:
         """Load and display a screenshot, scaled to keep its aspect ratio."""
@@ -321,6 +329,7 @@ class GameAgentGui(tk.Tk):
         """Show an error in the log and status bar without raising."""
         self._append_log(format_event({"event": "error", "message": message}))
         self._state_name = "ERROR"
+        self._terminal_status = "ERROR"
         self._refresh_status()
 
     def _read_viewport(self) -> tuple[int, int] | None:
@@ -340,17 +349,20 @@ class GameAgentGui(tk.Tk):
         """Refresh the status line from the session and usage tracker."""
         session = getattr(self._runner, "_session", None) if self._runner else None
         if session is not None:
-            state = getattr(session, "state", None)
-            state_name = getattr(state, "name", str(state))
-            self._state_name = state_name.upper()
             cycles = getattr(session, "cycles", self._cycles)
             remaining = getattr(session, "remaining_actions", self._remaining)
             if isinstance(cycles, int):
                 self._cycles = cycles
             if isinstance(remaining, int):
                 self._remaining = remaining
+            if self._terminal_status is None:
+                state = getattr(session, "state", None)
+                state_name = getattr(state, "name", str(state))
+                self._state_name = state_name.upper()
 
-        if self._runner_status == "paused":
+        if self._terminal_status is not None:
+            state = self._terminal_status
+        elif self._runner_status == "paused":
             state = f"PAUSED ({self._state_name})"
         else:
             state = self._state_name
@@ -386,11 +398,17 @@ class GameAgentGui(tk.Tk):
         )
 
     def _close(self) -> None:
-        """Shut down the runner and close the window."""
+        """Stop the runner and close the window without blocking Tk."""
         self._closed = True
         try:
-            if self._runner is not None:
-                self._runner.shutdown()
+            runner = self._runner
+            if runner is not None:
+                runner.stop()
+                threading.Thread(
+                    target=lambda: runner.shutdown(timeout=10),
+                    name="game-agent-gui-shutdown",
+                    daemon=False,
+                ).start()
         finally:
             self.destroy()
 
