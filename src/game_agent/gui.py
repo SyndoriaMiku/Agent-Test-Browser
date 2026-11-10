@@ -189,7 +189,7 @@ class GameAgentGui(tk.Tk):
             self.update_idletasks()
             previous = self._runner
             threading.Thread(
-                target=previous.shutdown,
+                target=lambda: previous.shutdown(timeout=10),
                 name="game-agent-gui-previous-shutdown",
                 daemon=True,
             ).start()

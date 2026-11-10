@@ -10,6 +10,7 @@ import json
 import queue
 import threading
 import time
+from pathlib import Path
 
 import game_agent.gui_runner as gui_runner
 from game_agent.config import Settings
@@ -315,6 +316,41 @@ def test_shutdown_returns_even_when_the_browser_cannot_open(tmp_path, clock):
         release.set()
     assert time.monotonic() - started < 10, "shutdown waited for the stuck browser"
     runner.join(timeout=15)
+
+
+# --- the browser profile -------------------------------------------------------
+
+
+def test_each_runner_gets_its_own_browser_profile(monkeypatch):
+    """Chromium locks a persistent profile exclusively.
+
+    A restart launches the new browser while the previous one is still
+    closing, so two runners must never share a profile directory.
+    """
+    built = []
+
+    class RecordingController:
+        """A controller that only remembers the options it was built with."""
+
+        def __init__(self, settings, options):
+            built.append(options)
+
+    monkeypatch.setattr(gui_runner, "BrowserController", RecordingController)
+    first = GuiRunner(queue.Queue())
+    second = GuiRunner(queue.Queue())
+    first._controller_factory("about:blank", Settings())
+    first._controller_factory("about:blank", Settings())
+    second._controller_factory("about:blank", Settings())
+
+    assert len(built) == 3
+    assert built[0].user_data_dir == built[1].user_data_dir, (
+        "a runner keeps the profile of its own run"
+    )
+    assert built[0].user_data_dir != built[2].user_data_dir, (
+        "two runners must not share a browser profile"
+    )
+    assert Path(built[0].user_data_dir).parent == Path(".browser-profile")
+    assert built[0].headless is False
 
 
 # --- the stop/close chain ----------------------------------------------------

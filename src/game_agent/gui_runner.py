@@ -21,6 +21,11 @@ Whatever happens, the runner ends up closed: the close is attempted exactly
 once and is marked as done even when there was no browser to close, so
 :meth:`GuiRunner.join` always returns.
 
+Every run gets a browser profile of its own under ``.browser-profile/``:
+Chromium locks a persistent profile exclusively, so a shared one would make
+the next run fail to launch while the browser of the previous run is still
+closing.
+
 The worker keeps its event loop alive after the session ended: Playwright's
 transport task lives on that loop, so closing it would leave the browser
 open but uncontrollable -- and impossible to close later.  The loop is
@@ -30,8 +35,10 @@ closed together with the browser.
 import asyncio
 import contextlib
 import inspect
+import os
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -47,6 +54,12 @@ from game_agent.schema import Action
 from game_agent.session import Session, VLMProtocol
 from game_agent.session_state import Clock
 from game_agent.vlm import VLMClient, load_vlm_config
+
+_PROFILE_ROOT = Path(".browser-profile")
+"""The directory the persistent browser profiles of the runs live in."""
+
+_CLOSE_JOIN_TIMEOUT = 10.0
+"""How long the background close waits for the worker to release its loop."""
 
 
 class RunnerController(Protocol):
@@ -111,7 +124,8 @@ class GuiRunner:
         queue: The queue the view drains; every event is put on it.
         controller_factory: Builds the browser controller of a run.  It is
             called as ``factory(url, settings, viewport)``; a factory that
-            takes only ``(url, settings)`` works as well.
+            takes only ``(url, settings)`` works as well.  The default
+            factory gives the run a browser profile of its own.
         vlm_factory: Builds the vision model of a run; called as
             ``factory(settings)``.
         session_kwargs: Extra keyword arguments for :class:`Session`
@@ -132,7 +146,7 @@ class GuiRunner:
     ) -> None:
         """Store the queue, the factories and the session keyword arguments."""
         self._queue = queue
-        self._controller_factory = controller_factory or _default_controller_factory
+        self._controller_factory = controller_factory or _run_controller_factory()
         self._vlm_factory = vlm_factory or _default_vlm_factory
         kwargs = dict(session_kwargs or {})
         self._logger_out = kwargs.pop("logger_out", None)
@@ -445,8 +459,13 @@ class GuiRunner:
         """Close the browser on *loop* and close the loop with it."""
         worker = self._thread
         if worker is not None and worker is not threading.current_thread():
-            # The worker owns the loop until it returns.
-            worker.join()
+            # The worker owns the loop until it returns.  The wait is
+            # bounded: a stuck worker must not keep this thread alive.
+            worker.join(timeout=_CLOSE_JOIN_TIMEOUT)
+            if worker.is_alive():
+                # The worker still owns the loop; it closes the browser
+                # itself when it tears down.
+                return
         asyncio.set_event_loop(loop)
         try:
             with contextlib.suppress(Exception):
@@ -475,15 +494,56 @@ class GuiRunner:
 
 
 def _default_controller_factory(
-    url: str, settings: Settings, viewport: tuple[int, int] | None = None
+    url: str,
+    settings: Settings,
+    viewport: tuple[int, int] | None = None,
+    *,
+    user_data_dir: str | None = None,
 ) -> BrowserController:
     """Build the real, headed browser controller of a run.
 
     The viewport lives in :class:`Settings` (the browser and the pointer
     coordinates share one CSS pixel space), so the factory only has to ask
-    for a headed browser.
+    for a headed browser.  *user_data_dir* names the persistent profile of
+    the run; without one a profile of its own is used.
     """
-    return BrowserController(settings, BrowserOptions(headless=False))
+    options = BrowserOptions(
+        headless=False,
+        user_data_dir=user_data_dir or _unique_profile_dir(),
+    )
+    return BrowserController(settings, options)
+
+
+def _run_controller_factory() -> ControllerFactory:
+    """Return the default controller factory of one run.
+
+    The factory is bound to a profile directory of its own: Chromium locks
+    a persistent profile exclusively, so a shared one would make the next
+    run fail to launch while the browser of the previous run is still
+    closing.
+    """
+    user_data_dir = _unique_profile_dir()
+
+    def factory(
+        url: str, settings: Settings, viewport: tuple[int, int] | None = None
+    ) -> BrowserController:
+        """Build the headed controller of this run."""
+        return _default_controller_factory(
+            url, settings, viewport, user_data_dir=user_data_dir
+        )
+
+    return factory
+
+
+def _unique_profile_dir() -> str:
+    """Return a browser profile directory that no other run uses.
+
+    The name carries the start time, the process and a random part, so two
+    runs -- even two that start in the same second -- get their own
+    directory under :data:`_PROFILE_ROOT`.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return str(_PROFILE_ROOT / f"{stamp}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
 
 
 def _default_vlm_factory(settings: Settings) -> VLMClient:
