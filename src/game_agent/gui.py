@@ -5,6 +5,11 @@ runs the session on a worker thread and publishes events on a queue; this
 module periodically drains that queue, appends human-readable lines to the
 log, updates the screenshot preview, and refreshes the status bar.
 
+Only one browser is open at a time: a Start that follows a previous run
+closes the browser of that run first.  The close happens on a worker
+thread -- the Tk thread never waits for it -- and the run that was asked
+for starts from the poll callback once the close is done.
+
 Run the application with ``python -m game_agent.gui``.
 """
 
@@ -15,6 +20,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import scrolledtext, ttk
 from typing import Any
@@ -27,6 +33,25 @@ from game_agent.gui_runner import GuiRunner
 
 _POLL_INTERVAL_MS = 150
 _PREVIEW_MAX_SIZE = (720, 480)
+_SHUTDOWN_TIMEOUT = 10.0
+"""How long a runner gets to close its browser before the GUI gives up on it."""
+
+
+@dataclass(frozen=True)
+class _PendingRun:
+    """A run that waits for the browser of the previous run to close."""
+
+    url: str
+    """The page the agent drives."""
+
+    goal: str
+    """The goal handed to the model."""
+
+    settings: Settings
+    """The agent's configuration."""
+
+    viewport: tuple[int, int]
+    """The browser viewport of the run, in CSS pixels."""
 
 
 def _default_url() -> str:
@@ -73,6 +98,7 @@ class GameAgentGui(tk.Tk):
         self._status_var = tk.StringVar(value="State: IDLE")
 
         self._runner: GuiRunner | None = None
+        self._pending: _PendingRun | None = None
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._usage = UsageTracker()
         self._input_price, self._output_price = _read_prices()
@@ -171,7 +197,7 @@ class GameAgentGui(tk.Tk):
         self._update_buttons()
 
     def _start(self) -> None:
-        """Stop any previous run, then start a fresh session."""
+        """Start a fresh session, after the previous browser is closed."""
         url = self._url_var.get().strip()
         goal = self._goal_var.get().strip()
         viewport = self._read_viewport()
@@ -184,22 +210,56 @@ class GameAgentGui(tk.Tk):
         if viewport is None:
             return
 
-        if self._runner is not None:
-            self._status_var.set("State: STOPPING")
-            self.update_idletasks()
-            previous = self._runner
-            threading.Thread(
-                target=lambda: previous.shutdown(timeout=10),
-                name="game-agent-gui-previous-shutdown",
-                daemon=True,
-            ).start()
-
         try:
             settings: Settings = load_settings()
         except (TypeError, ValueError) as exc:
             self._report_error(f"Invalid settings: {exc}")
             return
 
+        pending = _PendingRun(
+            url=url, goal=goal, settings=settings, viewport=viewport
+        )
+        if self._pending is not None:
+            # A close is already on its way: only the latest run is kept,
+            # so the runners never overlap.
+            self._pending = pending
+            return
+        if self._runner is not None:
+            # The browser of the previous run is still open: close it
+            # first and start this run once the close is done.
+            self._pending = pending
+            self._runner_status = "stopping"
+            self._terminal_status = "STOPPING"
+            self._refresh_status()
+            self._close_previous(self._runner)
+            return
+        self._launch(pending)
+
+    def _close_previous(self, previous: GuiRunner) -> None:
+        """Close the browser of *previous* off the Tk thread.
+
+        The Tk thread never waits for the close: a worker thread shuts the
+        previous runner down and reports back with a ``previous_closed``
+        event, which the poll handles on the Tk thread.  The worker only
+        touches the runner and the queue -- never a Tk method.
+        """
+        events = self._events
+
+        def close() -> None:
+            """Shut the previous runner down and report that it is done."""
+            try:
+                previous.shutdown(timeout=_SHUTDOWN_TIMEOUT)
+            finally:
+                events.put({"event": "previous_closed"})
+
+        threading.Thread(
+            target=close,
+            name="game-agent-gui-previous-shutdown",
+            daemon=True,
+        ).start()
+
+    def _launch(self, pending: _PendingRun) -> None:
+        """Create a runner for *pending* and start it on the Tk thread."""
         self._events = queue.Queue()
         self._usage = UsageTracker()
         self._runner_status = "starting"
@@ -217,10 +277,10 @@ class GameAgentGui(tk.Tk):
         runner = GuiRunner(self._events)
         try:
             runner.start(
-                url,
-                goal,
-                settings,
-                viewport=viewport,
+                pending.url,
+                pending.goal,
+                pending.settings,
+                viewport=pending.viewport,
                 grid_step=100,
             )
         except Exception as exc:
@@ -229,6 +289,14 @@ class GameAgentGui(tk.Tk):
             return
         self._runner = runner
         self._refresh_status()
+
+    def _start_pending(self) -> None:
+        """Start the run that waited for the previous browser to close."""
+        pending = self._pending
+        self._pending = None
+        if pending is None or self._closed:
+            return
+        self._launch(pending)
 
     def _pause(self) -> None:
         """Ask the current run to pause at its next cycle boundary."""
@@ -251,13 +319,19 @@ class GameAgentGui(tk.Tk):
         """Drain all queued runner events and refresh the view."""
         if self._closed:
             return
+        events = self._events
         try:
             while True:
                 try:
-                    event = self._events.get_nowait()
+                    event = events.get_nowait()
                 except queue.Empty:
                     break
                 self._handle_event(event)
+                if self._events is not events:
+                    # The run was replaced while the event was handled:
+                    # the rest of the old queue belongs to a runner the
+                    # view no longer shows.
+                    break
         finally:
             self._refresh_status()
             self._update_buttons()
@@ -266,8 +340,13 @@ class GameAgentGui(tk.Tk):
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         """Apply one runner event to the log, preview, and status."""
-        self._append_log(format_event(event))
         kind = event.get("event") if isinstance(event, dict) else None
+        if kind == "previous_closed":
+            # The browser of the previous run is closed: the run that
+            # waited for it can start now.
+            self._start_pending()
+            return
+        self._append_log(format_event(event))
 
         if kind == "observation":
             path = preview_path(event.get("screenshot_path"))
@@ -312,7 +391,7 @@ class GameAgentGui(tk.Tk):
                 image = source.convert("RGB")
                 image.thumbnail(_PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(image, master=self)
-        except (OSError, ValueError, tk.TclError) as exc:
+        except (OSError, ValueError, AttributeError, tk.TclError) as exc:
             self._append_log(f"preview unavailable: {exc}")
             return
         self._preview_photo = photo
@@ -400,12 +479,15 @@ class GameAgentGui(tk.Tk):
     def _close(self) -> None:
         """Stop the runner and close the window without blocking Tk."""
         self._closed = True
+        # A run that waits for the previous browser to close must not
+        # start once the window is gone.
+        self._pending = None
         try:
             runner = self._runner
             if runner is not None:
                 runner.stop()
                 threading.Thread(
-                    target=lambda: runner.shutdown(timeout=10),
+                    target=lambda: runner.shutdown(timeout=_SHUTDOWN_TIMEOUT),
                     name="game-agent-gui-shutdown",
                     daemon=False,
                 ).start()

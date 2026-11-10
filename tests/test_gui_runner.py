@@ -290,6 +290,41 @@ def test_shutdown_of_a_runner_that_never_started_returns(tmp_path, clock):
     assert runner.is_running is False
 
 
+def test_shutdown_retries_the_close_when_the_worker_outlives_the_deadline(tmp_path, clock):
+    """A worker that is still alive at the deadline gets one more close try."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowController(FakeController):
+        """A controller whose open waits, so the worker outlives the deadline."""
+
+        async def open(self):
+            entered.set()
+            await asyncio.get_running_loop().run_in_executor(None, release.wait)
+            await super().open()
+
+    q = queue.Queue()
+    controllers = []
+    def cf(url, settings):
+        c = SlowController(tmp_path, [b"A"]); controllers.append(c); return c
+    runner = GuiRunner(q, controller_factory=cf,
+        vlm_factory=lambda s: FakeVLM([dec({"type": "done", "summary": "ok"})]),
+        session_kwargs={"clock": clock, "sleep": make_sleep(clock), "logger_out": str(tmp_path / "g23.jsonl")})
+    runner.start("about:blank", "goal", Settings(), grid_step=None)
+    assert entered.wait(10), "the browser never started to open"
+
+    # The worker is released just after the shutdown deadline.
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    started = time.monotonic()
+    runner.shutdown(timeout=0.2)
+    elapsed = time.monotonic() - started
+    timer.join(10)
+
+    assert controllers[0].closed is True, "the browser was left open"
+    assert elapsed < 10, "shutdown waited for the stuck browser"
+
+
 def test_shutdown_returns_even_when_the_browser_cannot_open(tmp_path, clock):
     """A browser that never opens must not make shutdown wait forever."""
     entered = threading.Event()

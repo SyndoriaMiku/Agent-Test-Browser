@@ -61,6 +61,9 @@ _PROFILE_ROOT = Path(".browser-profile")
 _CLOSE_JOIN_TIMEOUT = 10.0
 """How long the background close waits for the worker to release its loop."""
 
+_SHUTDOWN_RETRY_TIMEOUT = 1.0
+"""How long a shutdown waits for a worker that outlived its deadline."""
+
 
 class RunnerController(Protocol):
     """The browser-controller surface the runner drives.
@@ -271,6 +274,11 @@ class GuiRunner:
         before a new Start -- to close the browser of the previous run --
         and when the window closes.
 
+        A worker that is still alive at the deadline owns the event loop,
+        so the close could not run yet; the worker closes the browser when
+        it tears down.  The shutdown gives it a short, bounded grace and
+        retries the close once more before it returns.
+
         Args:
             timeout: How long to wait for the worker and for the close, in
                 seconds; ``None`` waits forever.
@@ -281,6 +289,15 @@ class GuiRunner:
         # A run that ended normally leaves its browser open: close it now.
         self._close_browser_later()
         self._closed.wait(self._remaining(deadline))
+        if self.is_running:
+            # The worker is still alive at the deadline: it owns the event
+            # loop, so the close could not run yet.  Wait a short, bounded
+            # grace for the worker to close the browser, then retry the
+            # close once more, best-effort.
+            self._closed.wait(_SHUTDOWN_RETRY_TIMEOUT)
+            if not self._closed.is_set():
+                self._close_browser_later()
+                self._closed.wait(_SHUTDOWN_RETRY_TIMEOUT)
 
     @staticmethod
     def _remaining(deadline: float | None) -> float | None:
