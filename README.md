@@ -16,9 +16,10 @@ stays in the ledger for retry. The real vision-model client ([Vision model (M2)]
 turns a screenshot plus a goal into a schema-valid `Decision`. The closed-loop driver
 ([Closed-loop session (M3)](#closed-loop-session-m3)) now wires observe → decide → validate → act →
 verify together, showing the model a coordinate grid, checking each action against a screenshot diff,
-and bounding every run with limits that always terminate and always release held input. Still pending:
-M4 — pointing the working loop at one specific browser game (see
-[docs/roadmap.md](docs/roadmap.md)).
+and bounding every run with limits that always terminate and always release held input. The optional
+M5 desktop GUI is also implemented for observing and steering runs (see
+[Desktop GUI (M5)](#desktop-gui-m5)). Still pending: M4 — pointing the working loop at one specific
+browser game (see [docs/roadmap.md](docs/roadmap.md)).
 
 ## Install
 
@@ -56,8 +57,9 @@ Run the browser tests (they exercise the controller, mostly against [examples/de
 .venv\Scripts\python -m pytest -m browser
 ```
 
-- **The default suite stays offline.** `pyproject.toml` sets `addopts = -m "not browser and not live"`,
-  so a plain `pytest` filters the browser tests out unless you ask for them with `-m browser`.
+- **The default suite stays offline.** `pyproject.toml` sets
+  `addopts = -m "not browser and not live and not gui"`, so a plain `pytest` filters the browser
+  and display-dependent tests out unless you ask for them explicitly.
 - **Missing Chromium skips, not fails.** If the browser binary is not installed, the browser tests
   skip with a clear message pointing at the install command above — a fresh checkout is never red.
 
@@ -91,7 +93,8 @@ Configuration comes from `NVIDIA_*` variables, read by `load_vlm_config` (`src/g
   `load_vlm_config`, exactly as the client does, so they may come from the process environment
   **or** `.env`. As with the browser tests, a missing Chromium binary skips the test, never fails.
 - **The default suite stays offline.** The `live` marker is filtered out by the same `addopts` as
-  the `browser` marker, so a plain `pytest` never touches the network or your API key.
+  the `browser` marker, so a plain `pytest` never touches the network or your API key. GUI tests
+  are filtered out for the same reason unless they are explicitly selected.
 
 ## Closed-loop session (M3)
 
@@ -173,6 +176,39 @@ Playwright Chromium build (see [Browser PoC](#browser-poc)).
   rather than in `DONE`/`NEEDS_USER`. The loop still terminates and still releases its input, and the
   live test accepts that third terminal state — it asserts termination, not task success.
 
+## Desktop GUI (M5)
+
+The optional M5 desktop view lets you observe and steer a run without writing a script. Launch it
+from the repository root:
+
+```powershell
+python -m game_agent.gui
+```
+
+The window provides:
+
+- **URL**, **Goal**, and viewport **W**/**H** fields (the demo page and a `1280×720` viewport are
+  pre-filled), plus **Start**, **Pause**, **Resume**, and **Stop** buttons.
+- A live **preview** of the agent's screenshot (the coordinate-grid image when available) and a
+  read-only **log** of observations, decisions, actions, verification results, and runner status.
+- A **status bar** showing the current state, cycle count, remaining action budget, and accumulated
+  model tokens.
+
+The GUI opens its own **headed Chromium browser** and drives that browser only; it does not attach
+to or control a browser that is already open. A run needs the model configuration described in
+[Vision model (M2)](#vision-model-m2).
+
+Token cost is optional. To show a USD estimate in the status bar, set **both** of these environment
+variables to prices in **USD per 1,000,000 tokens**:
+
+```powershell
+$env:NVIDIA_PRICE_INPUT_PER_1M = "0.10"
+$env:NVIDIA_PRICE_OUTPUT_PER_1M = "0.40"
+```
+
+If either price is absent, the GUI shows tokens without a cost. The API key is never displayed in
+the window or log.
+
 ## Configuration
 
 Defaults live in `Settings` (`src/game_agent/config.py`). Each numeric field can be overridden by
@@ -209,6 +245,9 @@ $env:GAME_AGENT_VIEWPORT_WIDTH = "1920"
 | `vlm.py` | `VLMClient` + `load_vlm_config` — the real vision-model client (M2): turns a screenshot data URL plus goal into chat messages, POSTs them to an OpenAI-compatible `chat/completions` endpoint, and parses the reply into a schema-valid `Decision` (never arbitrary code); unparseable output is repaired once, then reported as a terminal `uncertain` decision; `NVIDIA_*` env/`.env` configuration (see [Vision model (M2)](#vision-model-m2)) |
 | `overlay.py` | `add_coordinate_grid` — the coordinate-grid overlay (M3): draws a labelled grid onto a **copy** of a screenshot with Pillow; spacing and labels are in CSS pixels (x labels along the bottom edge, y labels along the left edge, legend in the top-right corner), and the source image is never modified |
 | `session.py` | `Session` + `SessionResult` — the closed-loop driver (M3): runs observe → decide → validate → act → verify over an already-open controller, shows the model the grid-overlaid screenshot, verifies each action with a screenshot diff, and is bounded by `max_cycles`, the action budget, the consecutive-failure cap, the repeat limit and `stop()`; `release_all()` runs on every exit (see [Closed-loop session (M3)](#closed-loop-session-m3)) |
+| `gui.py` | The Tkinter desktop view (M5): URL/goal/viewport controls, Start/Pause/Resume/Stop, a scaled live screenshot preview, read-only event log, and status/cost bar; launch with `python -m game_agent.gui` |
+| `gui_model.py` | Pure GUI display helpers (M5): compact event formatting, screenshot preview-path selection, and token/cost accounting |
+| `gui_runner.py` | Background GUI runner (M5): runs one session on a worker thread, publishes JSONL and lifecycle events on a queue, and owns the headed browser's shutdown lifecycle |
 
 ## Documentation
 
